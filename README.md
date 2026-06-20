@@ -59,7 +59,7 @@ yunzhi
 - `test_loop` 支持测试驱动循环，未提供命令时自动探测 `cargo test`、`npm test`、`pytest`、`go test ./...` 等常见项目测试命令，返回失败摘要供智能体继续修复并重跑。
 - 支持一组高层生产力工具：`create_presentation` 制作可转 PPT 的 Marp Markdown 或 PPTX/POTX，`generate_image` 调用绘图/多模态模型生成图片结果，`write_document` 写 Markdown/Word/PDF/ODT/RTF/DOCX/DOTX/EPUB 文档，`write_table` 写 Markdown/CSV/TSV/Excel/XLSX/XLTX/XLS/ODS 表格，`office_document` 统一生成 Word、PPT、Excel、PDF、ODT、RTF、XLSX、ODS、TSV、CSV、XLS、XLTX、DOTX、DOCX、POTX、PPTX、EPUB，`ui_design` 生成 UI 智能设计规格。
 - 支持电脑与网络操作：`disk_manager` 管理磁盘用量、大文件和空目录，`computer_manager` 查看/打开/运行电脑任务，`computer_info` 获取系统、CPU、内存、磁盘、网络和环境信息，`web_search` 拉取网络搜索结果，`browser` 获取或打开网页，`network_logs` 获取连接、路由、DNS、ping 和响应头信息。
-- 支持数据与记忆操作：`database_manager` 调用 sqlite/psql/mysql/redis-cli 查询或管理数据库，`long_memory` 读取、追加、替换或清空项目长期记忆 `.yunzhi/memory.md`。
+- 支持数据与记忆操作：`database_manager` 调用 sqlite/psql/mysql/redis-cli 查询或管理数据库，`long_memory` 读取、追加、替换、清空项目长期记忆 `.yunzhi/memory.md`，也支持按条目 `add`、`list`、`search`、`delete` 管理标签化记忆。
 - 主控模型可通过 `--model` 或交互模式 `/model <模型名>` 切换；也可以通过 `list_models` 读取云智 API 可用模型列表，并通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
 - 支持本地 Skill：启动时索引 `.yunzhi/skills` 与 `~/.yunzhi/skills`，模型可用 `list_skills` 查看技能，用 `read_skill` 读取完整 Markdown 指令后执行。
 - 支持 MCP stdio client：读取 `.yunzhi/mcp.json` 与 `~/.yunzhi/mcp.json`，模型可用 `list_mcp_servers` 查看 server，用 `call_mcp_tool` 发起 `tools/call`，用 `mcp_resource` 调用 `resources/list`/`resources/read`，用 `mcp_prompt` 调用 `prompts/list`/`prompts/get`。
@@ -75,7 +75,7 @@ yunzhi
 - `manage_todos` 在当前会话中维护任务列表，支持新增、更新、列出和清空。
 - `ask_user` 支持 AI 在信息不足时向用户提问并读取自由文本回答；`choose_option` 支持 AI 给出候选项并让用户选择，也可允许自定义答案。
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
-- 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt。
+- 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt；条目化记忆会只注入最近摘要，避免长期记忆无限挤占上下文，旧版自由 Markdown 仍兼容。
 - 对话历史保存在内存中，超过阈值后做简单摘要压缩。
 - 交互模式支持 `/help`、`/mode`、`/model`、`/clear`、`/session`、`/exit`；快捷键包括 Enter 发送、Ctrl+J 换行、↑↓ 翻历史、Tab 应用补全、PageUp/PageDown 或鼠标滚轮滚动输出、Ctrl+Home 顶部、Ctrl+End 底部、Ctrl+C 退出。
 

@@ -1,4 +1,4 @@
-use crate::config::load_project_memory;
+use crate::config::load_project_memory_prompt;
 use crate::extensions::render_skills_index;
 use crate::hooks::{format_hook_runs, run_matching_hooks, HookEvent};
 use crate::llm::{ChatRequest, LlmClient, ToolChoice};
@@ -464,7 +464,7 @@ fn build_system_prompt(options: &AgentOptions) -> Result<String> {
         system_prompt.push_str("\n\nProfile 工具白名单: ");
         system_prompt.push_str(&tools.join(", "));
     }
-    if let Some(memory) = load_project_memory()? {
+    if let Some(memory) = load_project_memory_prompt()? {
         system_prompt.push_str("\n\n项目记忆 (.yunzhi/memory.md):\n");
         system_prompt.push_str(&memory);
     }

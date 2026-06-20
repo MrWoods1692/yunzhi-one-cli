@@ -1,3 +1,6 @@
+use crate::config::{
+    parse_memory_entries, render_memory_entry, search_memory_entries, MemoryEntry,
+};
 use crate::extensions::{
     call_mcp_tool, get_mcp_prompt, list_mcp_prompts, list_mcp_resources, load_mcp_servers,
     read_mcp_resource, read_skill, skills_index,
@@ -3008,10 +3011,21 @@ impl Tool for LongMemoryTool {
         "long_memory"
     }
     fn description(&self) -> &'static str {
-        "管理项目长期记忆 .yunzhi/memory.md，支持 read、append、replace、clear"
+        "管理和检索项目长期记忆 .yunzhi/memory.md，支持 read、add、list、search、delete、append、replace、clear"
     }
     fn schema(&self) -> Value {
-        json!({"type":"object","properties":{"action":{"type":"string","enum":["read","append","replace","clear"]},"content":{"type":"string"}},"required":["action"]})
+        json!({
+            "type":"object",
+            "properties":{
+                "action":{"type":"string","enum":["read","add","list","search","delete","append","replace","clear"]},
+                "content":{"type":"string","description":"add/append/replace 写入的记忆内容"},
+                "query":{"type":"string","description":"search 查询关键词，可匹配正文、标签或 id"},
+                "id":{"type":"string","description":"delete 删除的记忆 id"},
+                "tags":{"type":"array","items":{"type":"string"},"description":"add 时写入的标签"},
+                "limit":{"type":"integer","description":"list/search 返回条数，默认 20"}
+            },
+            "required":["action"]
+        })
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
         let path = context.cwd.join(".yunzhi").join("memory.md");
@@ -3019,6 +3033,64 @@ impl Tool for LongMemoryTool {
             "read" => Ok(ToolOutput::ok(
                 fs::read_to_string(&path).await.unwrap_or_default(),
             )),
+            "add" => {
+                let content = string_arg(&args, "content")?;
+                let tags = array_of_strings_arg(&args, "tags")?;
+                let old = fs::read_to_string(&path).await.unwrap_or_default();
+                let entry = MemoryEntry {
+                    id: next_memory_id(&old),
+                    tags: clean_memory_tags(tags),
+                    text: content.trim().to_string(),
+                };
+                anyhow::ensure!(!entry.text.is_empty(), "长期记忆内容不能为空");
+                let mut new = old.clone();
+                if new.trim().is_empty() {
+                    new.push_str("# 项目长期记忆\n\n");
+                } else if !new.ends_with('\n') {
+                    new.push('\n');
+                }
+                new.push_str(&render_memory_entry(&entry));
+                new.push('\n');
+                write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    new,
+                    context,
+                    format!("新增长期记忆 {}", entry.id),
+                )
+                .await
+            }
+            "list" => {
+                let content = fs::read_to_string(&path).await.unwrap_or_default();
+                let limit = optional_u64_arg(&args, "limit", 20).clamp(1, 200) as usize;
+                let entries = parse_memory_entries(&content);
+                Ok(ToolOutput::ok(render_memory_entries(
+                    entries.iter().rev().take(limit),
+                )))
+            }
+            "search" => {
+                let content = fs::read_to_string(&path).await.unwrap_or_default();
+                let query = string_arg(&args, "query")?;
+                let limit = optional_u64_arg(&args, "limit", 20).clamp(1, 200) as usize;
+                let entries = parse_memory_entries(&content);
+                let matches = search_memory_entries(&entries, &query);
+                Ok(ToolOutput::ok(render_memory_entries(
+                    matches.into_iter().take(limit),
+                )))
+            }
+            "delete" => {
+                let id = string_arg(&args, "id")?;
+                let old = fs::read_to_string(&path).await.unwrap_or_default();
+                let new = delete_memory_entry(&old, &id)?;
+                write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    new,
+                    context,
+                    format!("删除长期记忆 {id}"),
+                )
+                .await
+            }
             "append" => {
                 let old = fs::read_to_string(&path).await.unwrap_or_default();
                 let mut new = old.clone();
@@ -3059,6 +3131,69 @@ impl Tool for LongMemoryTool {
             action => anyhow::bail!("不支持的长期记忆操作: {action}"),
         }
     }
+}
+
+fn next_memory_id(content: &str) -> String {
+    let next = parse_memory_entries(content)
+        .iter()
+        .filter_map(|entry| entry.id.strip_prefix('m'))
+        .filter_map(|number| number.parse::<u64>().ok())
+        .max()
+        .unwrap_or(0)
+        + 1;
+    format!("m{next:04}")
+}
+
+fn clean_memory_tags(tags: Vec<String>) -> Vec<String> {
+    let mut cleaned = tags
+        .into_iter()
+        .map(|tag| tag.trim().to_lowercase())
+        .filter(|tag| !tag.is_empty())
+        .map(|tag| {
+            tag.chars()
+                .map(|ch| {
+                    if ch.is_alphanumeric() || ch == '-' || ch == '_' {
+                        ch
+                    } else {
+                        '-'
+                    }
+                })
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>();
+    cleaned.sort();
+    cleaned.dedup();
+    cleaned
+}
+
+fn render_memory_entries<'a>(entries: impl Iterator<Item = &'a MemoryEntry>) -> String {
+    let rendered = entries.map(render_memory_entry).collect::<Vec<_>>();
+    if rendered.is_empty() {
+        "未找到长期记忆。".to_string()
+    } else {
+        rendered.join("\n")
+    }
+}
+
+fn delete_memory_entry(content: &str, id: &str) -> Result<String> {
+    let target = format!("- [id:{}]", id.trim());
+    let mut removed = false;
+    let kept = content
+        .lines()
+        .filter(|line| {
+            let is_target = line.trim_start().starts_with(&target);
+            if is_target {
+                removed = true;
+            }
+            !is_target
+        })
+        .collect::<Vec<_>>();
+    anyhow::ensure!(removed, "未找到长期记忆 id: {id}");
+    let mut new = kept.join("\n");
+    if !new.is_empty() {
+        new.push('\n');
+    }
+    Ok(new)
 }
 
 fn value_to_cell(value: &Value) -> String {
@@ -4931,6 +5066,67 @@ mod tests {
             .execute("long_memory", json!({"action":"read"}), &mut ctx)
             .await;
         assert!(output.content.contains("记住项目约定"));
+    }
+
+    #[tokio::test]
+    async fn searches_and_deletes_structured_long_memory() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+
+        let output = registry
+            .execute(
+                "long_memory",
+                json!({"action":"add","content":"Rust 修改后必须运行 cargo test","tags":["Rust", "test"]}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute(
+                "long_memory",
+                json!({"action":"add","content":"README 需要同步更新","tags":["docs"]}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+
+        let output = registry
+            .execute(
+                "long_memory",
+                json!({"action":"search","query":"rust test"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(output.content.contains("m0001"));
+        assert!(output.content.contains("cargo test"));
+        assert!(!output.content.contains("README 需要同步更新"));
+
+        let output = registry
+            .execute(
+                "long_memory",
+                json!({"action":"delete","id":"m0001"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute("long_memory", json!({"action":"list"}), &mut ctx)
+            .await;
+        assert!(!output.content.contains("cargo test"));
+        assert!(output.content.contains("README 需要同步更新"));
+    }
+
+    #[test]
+    fn compact_memory_prompt_keeps_recent_structured_entries() {
+        let content = (1..=45)
+            .map(|index| format!("- [id:m{index:04}] [tags:test] 记忆 {index}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let prompt = crate::config::render_memory_prompt(&content);
+        assert!(!prompt.contains("m0001"));
+        assert!(prompt.contains("m0045"));
+        assert!(prompt.contains("已省略 5 条"));
     }
 
     #[test]

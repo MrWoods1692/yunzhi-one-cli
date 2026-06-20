@@ -1,10 +1,14 @@
 use crate::types::{AgentMode, AppConfig};
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+
+const MEMORY_ENTRY_PREFIX: &str = "- [id:";
+const MEMORY_PROMPT_LIMIT: usize = 40;
 
 pub fn config_dir() -> Result<PathBuf> {
     let home = dirs::home_dir().context("无法定位用户 home 目录")?;
@@ -138,6 +142,126 @@ pub fn load_project_memory() -> Result<Option<String>> {
     } else {
         Ok(Some(content))
     }
+}
+
+pub fn load_project_memory_prompt() -> Result<Option<String>> {
+    Ok(load_project_memory()?.map(|content| render_memory_prompt(&content)))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MemoryEntry {
+    pub id: String,
+    pub tags: Vec<String>,
+    pub text: String,
+}
+
+pub fn parse_memory_entries(content: &str) -> Vec<MemoryEntry> {
+    content
+        .lines()
+        .filter_map(parse_memory_entry_line)
+        .collect()
+}
+
+pub fn render_memory_entry(entry: &MemoryEntry) -> String {
+    let tags = if entry.tags.is_empty() {
+        String::new()
+    } else {
+        format!(" [tags:{}]", entry.tags.join(","))
+    };
+    format!("- [id:{}]{} {}", entry.id, tags, entry.text.trim())
+}
+
+pub fn render_memory_prompt(content: &str) -> String {
+    let entries = parse_memory_entries(content);
+    if entries.is_empty() {
+        return content.trim().to_string();
+    }
+    let mut rendered = entries
+        .iter()
+        .rev()
+        .take(MEMORY_PROMPT_LIMIT)
+        .rev()
+        .map(render_memory_entry)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let omitted = entries.len().saturating_sub(MEMORY_PROMPT_LIMIT);
+    if omitted > 0 {
+        rendered.push_str(&format!(
+            "\n... 已省略 {omitted} 条较早记忆，可用 long_memory search 查询。"
+        ));
+    }
+    rendered
+}
+
+pub fn search_memory_entries<'a>(entries: &'a [MemoryEntry], query: &str) -> Vec<&'a MemoryEntry> {
+    let terms = query_terms(query);
+    if terms.is_empty() {
+        return entries.iter().collect();
+    }
+    let mut scored = entries
+        .iter()
+        .filter_map(|entry| {
+            let score = memory_entry_score(entry, &terms);
+            (score > 0).then_some((score, entry))
+        })
+        .collect::<Vec<_>>();
+    scored.sort_by_key(|(score, entry)| (Reverse(*score), Reverse(entry.id.clone())));
+    scored.into_iter().map(|(_, entry)| entry).collect()
+}
+
+fn parse_memory_entry_line(line: &str) -> Option<MemoryEntry> {
+    let rest = line.trim().strip_prefix(MEMORY_ENTRY_PREFIX)?;
+    let (id, rest) = rest.split_once(']')?;
+    let rest = rest.trim_start();
+    let (tags, text) = if let Some(rest) = rest.strip_prefix("[tags:") {
+        let (raw_tags, text) = rest.split_once(']')?;
+        (
+            raw_tags
+                .split(',')
+                .map(str::trim)
+                .filter(|tag| !tag.is_empty())
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            text.trim_start(),
+        )
+    } else {
+        (Vec::new(), rest)
+    };
+    let id = id.trim().to_string();
+    let text = text.trim().to_string();
+    (!id.is_empty() && !text.is_empty()).then_some(MemoryEntry { id, tags, text })
+}
+
+fn query_terms(query: &str) -> Vec<String> {
+    query
+        .split(|ch: char| ch.is_whitespace() || ch == ',' || ch == ';')
+        .map(str::trim)
+        .filter(|term| !term.is_empty())
+        .map(|term| term.to_lowercase())
+        .collect()
+}
+
+fn memory_entry_score(entry: &MemoryEntry, terms: &[String]) -> usize {
+    let text = entry.text.to_lowercase();
+    let id = entry.id.to_lowercase();
+    let tags = entry
+        .tags
+        .iter()
+        .map(|tag| tag.to_lowercase())
+        .collect::<Vec<_>>();
+    terms
+        .iter()
+        .map(|term| {
+            let id_score = (id == *term) as usize * 8;
+            let tag_score = tags
+                .iter()
+                .filter(|tag| tag.contains(term.as_str()))
+                .count()
+                * 4;
+            let text_score = text.matches(term.as_str()).count();
+            id_score + tag_score + text_score
+        })
+        .sum()
 }
 
 #[cfg(test)]
