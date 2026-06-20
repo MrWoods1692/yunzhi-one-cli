@@ -1430,6 +1430,9 @@ impl LogLine {
             LogKind::Error => ("x ", Style::default().fg(Color::Red)),
             LogKind::Dim => ("  ", Style::default().fg(Color::DarkGray)),
         };
+        if matches!(self.kind, LogKind::Agent) {
+            return render_markdown_items(&self.text, content_width, Some((label, style)));
+        }
         let label_width = display_width(label);
         let continuation_width = display_width(CONTINUATION_PREFIX);
         let first_width = content_width.saturating_sub(label_width).max(1);
@@ -1468,32 +1471,245 @@ impl LogLine {
 }
 
 fn wrap_team_message(message: &str, content_width: usize) -> Vec<ListItem<'static>> {
-    let continuation_width = display_width(CONTINUATION_PREFIX);
-    let first_width = content_width.max(1);
-    let continuation_text_width = content_width.saturating_sub(continuation_width).max(1);
-    message
-        .lines()
-        .chain(if message.ends_with('\n') {
-            Some("")
-        } else {
-            None
-        })
+    render_markdown_items(message, content_width, None)
+}
+
+#[derive(Clone)]
+struct StyledText {
+    text: String,
+    style: Style,
+}
+
+impl StyledText {
+    fn new(text: impl Into<String>, style: Style) -> Self {
+        Self {
+            text: text.into(),
+            style,
+        }
+    }
+}
+
+fn render_markdown_items(
+    text: &str,
+    content_width: usize,
+    first_prefix: Option<(&'static str, Style)>,
+) -> Vec<ListItem<'static>> {
+    let mut in_code_block = false;
+    text.lines()
+        .chain(if text.ends_with('\n') { Some("") } else { None })
         .flat_map(|line| {
-            wrap_display_line(line, first_width, continuation_text_width)
-                .into_iter()
-                .enumerate()
-                .map(move |(index, part)| {
-                    if index == 0 {
-                        ListItem::new(Line::from(part))
-                    } else {
-                        ListItem::new(Line::from(vec![
-                            Span::styled(CONTINUATION_PREFIX, Style::default().fg(Color::DarkGray)),
-                            Span::raw(part),
-                        ]))
-                    }
-                })
+            let spans = markdown_line_spans(line, &mut in_code_block);
+            wrap_styled_line(spans, content_width, first_prefix)
         })
         .collect()
+}
+
+fn markdown_line_spans(line: &str, in_code_block: &mut bool) -> Vec<StyledText> {
+    let trimmed = line.trim_start();
+    let base = Style::default().fg(Color::White);
+    if trimmed.starts_with("```") {
+        *in_code_block = !*in_code_block;
+        let label = trimmed.trim_matches('`').trim();
+        let text = if label.is_empty() {
+            "```".to_string()
+        } else {
+            format!("``` {label}")
+        };
+        return vec![StyledText::new(text, Style::default().fg(Color::DarkGray))];
+    }
+    if *in_code_block {
+        return vec![StyledText::new(
+            format!("  {line}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .bg(Color::Rgb(34, 40, 49)),
+        )];
+    }
+    if line.trim().is_empty() {
+        return vec![StyledText::new(String::new(), base)];
+    }
+    if matches!(trimmed, "---" | "***" | "___") {
+        return vec![StyledText::new(
+            "────────────────────────".to_string(),
+            Style::default().fg(Color::DarkGray),
+        )];
+    }
+    if let Some((level, title)) = markdown_heading(trimmed) {
+        let marker = match level {
+            1 => "# ",
+            2 => "## ",
+            _ => "### ",
+        };
+        let mut spans = vec![StyledText::new(
+            marker,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )];
+        spans.extend(inline_markdown_spans(
+            title,
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        ));
+        return spans;
+    }
+    if let Some(rest) = trimmed.strip_prefix("> ") {
+        let mut spans = vec![StyledText::new("│ ", Style::default().fg(Color::DarkGray))];
+        spans.extend(inline_markdown_spans(
+            rest,
+            Style::default()
+                .fg(Color::Gray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+        return spans;
+    }
+    if let Some(rest) = trimmed
+        .strip_prefix("- [x] ")
+        .or_else(|| trimmed.strip_prefix("- [X] "))
+    {
+        let mut spans = vec![StyledText::new("☑ ", Style::default().fg(Color::Green))];
+        spans.extend(inline_markdown_spans(rest, base));
+        return spans;
+    }
+    if let Some(rest) = trimmed.strip_prefix("- [ ] ") {
+        let mut spans = vec![StyledText::new("☐ ", Style::default().fg(Color::Yellow))];
+        spans.extend(inline_markdown_spans(rest, base));
+        return spans;
+    }
+    if let Some(rest) = markdown_unordered_item(trimmed) {
+        let mut spans = vec![StyledText::new("• ", Style::default().fg(Color::Yellow))];
+        spans.extend(inline_markdown_spans(rest, base));
+        return spans;
+    }
+    if let Some((number, rest)) = markdown_ordered_item(trimmed) {
+        let mut spans = vec![StyledText::new(
+            format!("{number}. "),
+            Style::default().fg(Color::Yellow),
+        )];
+        spans.extend(inline_markdown_spans(rest, base));
+        return spans;
+    }
+    inline_markdown_spans(line, base)
+}
+
+fn markdown_heading(line: &str) -> Option<(usize, &str)> {
+    let level = line.chars().take_while(|ch| *ch == '#').count();
+    if (1..=6).contains(&level) && line.chars().nth(level).is_some_and(|ch| ch == ' ') {
+        Some((level, line[level + 1..].trim_start()))
+    } else {
+        None
+    }
+}
+
+fn markdown_unordered_item(line: &str) -> Option<&str> {
+    ["- ", "* ", "+ "]
+        .iter()
+        .find_map(|prefix| line.strip_prefix(prefix))
+}
+
+fn markdown_ordered_item(line: &str) -> Option<(&str, &str)> {
+    let dot = line.find(". ")?;
+    let number = &line[..dot];
+    if number.chars().all(|ch| ch.is_ascii_digit()) {
+        Some((number, &line[dot + 2..]))
+    } else {
+        None
+    }
+}
+
+fn inline_markdown_spans(text: &str, base: Style) -> Vec<StyledText> {
+    let mut spans = Vec::new();
+    let mut rest = text;
+    while !rest.is_empty() {
+        let next = ["`", "**", "*"]
+            .iter()
+            .filter_map(|marker| rest.find(marker).map(|index| (index, *marker)))
+            .min_by_key(|(index, _)| *index);
+        let Some((index, marker)) = next else {
+            spans.push(StyledText::new(rest.to_string(), base));
+            break;
+        };
+        if index > 0 {
+            spans.push(StyledText::new(rest[..index].to_string(), base));
+        }
+        let after_marker = &rest[index + marker.len()..];
+        if let Some(end) = after_marker.find(marker) {
+            let content = &after_marker[..end];
+            let style = match marker {
+                "`" => Style::default()
+                    .fg(Color::Yellow)
+                    .bg(Color::Rgb(34, 40, 49)),
+                "**" => base.add_modifier(Modifier::BOLD),
+                "*" => base.add_modifier(Modifier::ITALIC),
+                _ => base,
+            };
+            spans.push(StyledText::new(content.to_string(), style));
+            rest = &after_marker[end + marker.len()..];
+        } else {
+            spans.push(StyledText::new(rest[index..].to_string(), base));
+            break;
+        }
+    }
+    spans
+}
+
+fn wrap_styled_line(
+    spans: Vec<StyledText>,
+    content_width: usize,
+    first_prefix: Option<(&'static str, Style)>,
+) -> Vec<ListItem<'static>> {
+    let content_width = content_width.max(1);
+    let continuation_width = display_width(CONTINUATION_PREFIX);
+    let mut rows = Vec::new();
+    let first_prefix = first_prefix.map(|(text, style)| StyledText::new(text, style));
+    let continuation_prefix =
+        StyledText::new(CONTINUATION_PREFIX, Style::default().fg(Color::DarkGray));
+    let mut current = Vec::new();
+    let mut current_width = 0usize;
+    let mut prefix_width = 0usize;
+
+    if let Some(prefix) = first_prefix.clone() {
+        prefix_width = display_width(&prefix.text);
+        current_width = prefix_width;
+        current.push(prefix);
+    }
+
+    for span in spans {
+        for ch in span.text.chars() {
+            let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+            if current_width > prefix_width && current_width + char_width > content_width {
+                rows.push(styled_row_to_item(std::mem::take(&mut current)));
+                current.push(continuation_prefix.clone());
+                prefix_width = continuation_width;
+                current_width = continuation_width;
+            }
+            push_styled_char(&mut current, ch, span.style);
+            current_width += char_width;
+        }
+    }
+
+    rows.push(styled_row_to_item(current));
+    rows
+}
+
+fn push_styled_char(parts: &mut Vec<StyledText>, ch: char, style: Style) {
+    if let Some(last) = parts.last_mut() {
+        if last.style == style {
+            last.text.push(ch);
+            return;
+        }
+    }
+    parts.push(StyledText::new(ch.to_string(), style));
+}
+
+fn styled_row_to_item(parts: Vec<StyledText>) -> ListItem<'static> {
+    ListItem::new(Line::from(
+        parts
+            .into_iter()
+            .map(|part| Span::styled(part.text, part.style))
+            .collect::<Vec<_>>(),
+    ))
 }
 
 fn wrap_display_line(line: &str, first_width: usize, continuation_width: usize) -> Vec<String> {
@@ -1921,6 +2137,39 @@ mod tests {
         let items = LogLine::info("abcdefghij").to_items(6);
 
         assert_eq!(items.len(), 3);
+    }
+
+    #[test]
+    fn markdown_renderer_recognizes_common_blocks() {
+        let mut in_code_block = false;
+
+        let heading = markdown_line_spans("## 标题", &mut in_code_block);
+        assert_eq!(heading[0].text, "## ");
+        assert!(heading[0].style.add_modifier.contains(Modifier::BOLD));
+
+        let list = markdown_line_spans("- item", &mut in_code_block);
+        assert_eq!(list[0].text, "• ");
+
+        let code = markdown_line_spans("`cmd`", &mut in_code_block);
+        assert_eq!(code[0].text, "cmd");
+        assert_eq!(code[0].style.fg, Some(Color::Yellow));
+    }
+
+    #[test]
+    fn markdown_renderer_styles_code_blocks() {
+        let mut in_code_block = false;
+
+        let opening = markdown_line_spans("```rust", &mut in_code_block);
+        assert_eq!(opening[0].text, "``` rust");
+        assert!(in_code_block);
+
+        let body = markdown_line_spans("let value = 1;", &mut in_code_block);
+        assert_eq!(body[0].text, "  let value = 1;");
+        assert_eq!(body[0].style.fg, Some(Color::Yellow));
+
+        let closing = markdown_line_spans("```", &mut in_code_block);
+        assert_eq!(closing[0].text, "```");
+        assert!(!in_code_block);
     }
 
     #[test]
