@@ -4,12 +4,10 @@ use crate::config::{
 };
 use crate::llm::AnthropicLikeClient;
 use crate::mcp_server;
-use crate::tui::{self, StdoutPrompter};
+use crate::tui::{self, EventPrompter, StdoutPrompter};
 use crate::types::{AgentMode, AgentOptions, AppConfig};
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use rustyline::error::ReadlineError;
-use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Parser)]
@@ -124,6 +122,7 @@ async fn build_agent(
     dangerously_skip_permissions: bool,
     mode: AgentMode,
     profile_name: Option<String>,
+    fullscreen: bool,
 ) -> Result<Agent<AnthropicLikeClient>> {
     let config = ensure_config_interactive()?;
     let cwd = std::env::current_dir()?;
@@ -158,7 +157,11 @@ async fn build_agent(
         cwd,
         config.api_key,
         options,
-        Arc::new(StdoutPrompter),
+        if fullscreen {
+            Arc::new(EventPrompter)
+        } else {
+            Arc::new(StdoutPrompter)
+        },
     )
 }
 
@@ -168,7 +171,7 @@ async fn run_print(
     mode: AgentMode,
     profile: Option<String>,
 ) -> Result<()> {
-    let mut agent = build_agent(dangerously_skip_permissions, mode, profile).await?;
+    let mut agent = build_agent(dangerously_skip_permissions, mode, profile, false).await?;
     agent.run_turn(prompt).await?;
     Ok(())
 }
@@ -178,133 +181,6 @@ async fn run_interactive(
     mode: AgentMode,
     profile: Option<String>,
 ) -> Result<()> {
-    tui::print_banner(env!("CARGO_PKG_VERSION"))?;
-    println!("{}", tui::ratatui_plan());
-    let mut agent = build_agent(dangerously_skip_permissions, mode, profile).await?;
-    println!("当前模式: {}。输入 /mode 查看或切换。\n", agent.mode());
-    let mut editor = rustyline::DefaultEditor::new()?;
-    let mut last_request: Option<String> = None;
-
-    loop {
-        match editor.readline("yunzhi> ") {
-            Ok(line) => {
-                let input = line.trim();
-                if input.is_empty() {
-                    continue;
-                }
-                let _ = editor.add_history_entry(input);
-                match input {
-                    "/exit" => break,
-                    "/help" => tui::print_help(),
-                    "/clear" => {
-                        agent.clear()?;
-                        println!("上下文已清空。\n");
-                    }
-                    "/mode" => tui::print_modes(agent.mode()),
-                    _ => {
-                        if let Some(command) = input.strip_prefix("/session") {
-                            if let Err(error) = handle_session_command(&mut agent, command.trim()) {
-                                eprintln!("错误: {error:#}");
-                            }
-                            continue;
-                        }
-                        if let Some(raw_mode) = input.strip_prefix("/mode ") {
-                            match AgentMode::from_str(raw_mode) {
-                                Ok(mode) => {
-                                    agent.set_mode(mode)?;
-                                    println!("已切换到 {} 模式。\n", agent.mode());
-                                }
-                                Err(error) => eprintln!("错误: {error}"),
-                            }
-                            continue;
-                        }
-                        tui::print_user(input);
-                        let turn_input = if is_confirmation(input) {
-                            last_request
-                                .as_ref()
-                                .map(|request| format!("确认执行上一条请求: {request}"))
-                                .unwrap_or_else(|| input.to_string())
-                        } else {
-                            last_request = Some(input.to_string());
-                            input.to_string()
-                        };
-                        if let Err(error) = agent.run_turn(turn_input).await {
-                            eprintln!("错误: {error:#}");
-                        }
-                    }
-                }
-            }
-            Err(ReadlineError::Interrupted) => {
-                println!("已中断当前输入。输入 /exit 退出。 ");
-            }
-            Err(ReadlineError::Eof) => break,
-            Err(error) => return Err(error.into()),
-        }
-    }
-
-    Ok(())
-}
-
-fn is_confirmation(input: &str) -> bool {
-    matches!(
-        input.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes" | "ok" | "okay" | "确认" | "可以" | "好" | "好的"
-    )
-}
-
-fn handle_session_command(agent: &mut Agent<AnthropicLikeClient>, command: &str) -> Result<()> {
-    let mut parts = command.split_whitespace();
-    match parts.next() {
-        None | Some("help") => {
-            println!("/session list");
-            println!("/session save <name>");
-            println!("/session resume <name>");
-            println!("/session share <name>");
-            println!("/session checkpoint <name> [note]");
-            println!("/session rollback <name> <checkpoint>\n");
-        }
-        Some("list") => {
-            let sessions = agent.list_sessions()?;
-            if sessions.is_empty() {
-                println!("暂无已保存会话。\n");
-            } else {
-                for session in sessions {
-                    println!("{session}");
-                }
-                println!();
-            }
-        }
-        Some("save") => {
-            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
-            let path = agent.save_session(id)?;
-            println!("会话已保存: {}\n", path.display());
-        }
-        Some("resume") => {
-            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
-            agent.resume_session(id)?;
-            println!("已恢复会话: {id}\n");
-        }
-        Some("share") => {
-            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
-            let path = agent.share_session(id)?;
-            println!("分享文件已生成: {}\n", path.display());
-        }
-        Some("checkpoint") => {
-            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
-            let note = parts.collect::<Vec<_>>().join(" ");
-            let checkpoint =
-                agent.checkpoint_session(id, if note.is_empty() { None } else { Some(note) })?;
-            println!("checkpoint 已创建: {checkpoint}\n");
-        }
-        Some("rollback") => {
-            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
-            let checkpoint = parts
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("缺少 checkpoint id"))?;
-            agent.rollback_session(id, checkpoint)?;
-            println!("已回滚到 checkpoint: {checkpoint}\n");
-        }
-        Some(other) => anyhow::bail!("未知 session 命令: {other}"),
-    }
-    Ok(())
+    let agent = build_agent(dangerously_skip_permissions, mode, profile, true).await?;
+    tui::run_fullscreen(agent, env!("CARGO_PKG_VERSION")).await
 }
