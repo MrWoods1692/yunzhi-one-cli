@@ -1017,46 +1017,30 @@ impl Tool for BashTool {
         "bash"
     }
     fn description(&self) -> &'static str {
-        "在当前工作目录执行 shell 命令，执行前请求确认"
+        "在隔离的工作区副本中执行 shell 命令，执行前请求确认；sandbox=false 时在当前目录执行"
     }
     fn schema(&self) -> Value {
-        json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}},"required":["command"]})
+        json!({"type":"object","properties":{"command":{"type":"string"},"timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"},"sandbox":{"type":"boolean","description":"是否在临时工作区副本中执行，默认 true"}},"required":["command"]})
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
         let command = string_arg(&args, "command")?;
         let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let sandbox = bool_arg(&args, "sandbox", true);
         context
             .confirm(PermissionRequest {
                 tool_name: self.name().to_string(),
-                summary: format!("执行命令: {command}"),
+                summary: format!(
+                    "执行命令{}: {command}",
+                    if sandbox {
+                        "（沙箱）"
+                    } else {
+                        "（当前工作区）"
+                    }
+                ),
                 diff: None,
             })
             .await?;
-        let started = Instant::now();
-        let output = timeout(
-            Duration::from_secs(timeout_secs),
-            Command::new("sh")
-                .arg("-c")
-                .arg(&command)
-                .current_dir(&context.cwd)
-                .output(),
-        )
-        .await
-        .map_err(|_| anyhow!("命令超时，已终止: {command}"))??;
-        let elapsed = started.elapsed().as_secs_f32();
-        let mut rendered = format!("exit: {} ({elapsed:.1}s)\n", output.status);
-        if !output.stdout.is_empty() {
-            rendered.push_str("stdout:\n");
-            rendered.push_str(&String::from_utf8_lossy(&output.stdout));
-        }
-        if !output.stderr.is_empty() {
-            rendered.push_str("\nstderr:\n");
-            rendered.push_str(&String::from_utf8_lossy(&output.stderr));
-        }
-        Ok(ToolOutput {
-            content: rendered,
-            is_error: !output.status.success(),
-        })
+        run_shell_command(&command, &context.cwd, timeout_secs, sandbox).await
     }
 }
 
@@ -1578,7 +1562,8 @@ impl Tool for ExecuteCodeTool {
             "properties":{
                 "language":{"type":"string","enum":["python","javascript","node","bash","sh","rust"],"description":"代码语言"},
                 "code":{"type":"string","description":"要执行的代码片段"},
-                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"}
+                "timeout":{"type":"integer","description":"超时时间，单位秒，默认 30"},
+                "sandbox":{"type":"boolean","description":"是否在临时工作区副本中执行，默认 true"}
             },
             "required":["language","code"]
         })
@@ -1587,6 +1572,7 @@ impl Tool for ExecuteCodeTool {
         let language = string_arg(&args, "language")?.to_lowercase();
         let code = string_arg(&args, "code")?;
         let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        let sandbox = bool_arg(&args, "sandbox", true);
         let command = match language.as_str() {
             "python" => vec!["python3".to_string(), "-c".to_string(), code.clone()],
             "javascript" | "node" => vec!["node".to_string(), "-e".to_string(), code.clone()],
@@ -1597,11 +1583,19 @@ impl Tool for ExecuteCodeTool {
         context
             .confirm(PermissionRequest {
                 tool_name: self.name().to_string(),
-                summary: format!("执行 {} 代码片段", language),
+                summary: format!(
+                    "执行 {} 代码片段{}",
+                    language,
+                    if sandbox {
+                        "（沙箱）"
+                    } else {
+                        "（当前工作区）"
+                    }
+                ),
                 diff: None,
             })
             .await?;
-        run_command(command, &context.cwd, timeout_secs).await
+        run_command_with_sandbox(command, &context.cwd, timeout_secs, sandbox).await
     }
 }
 
@@ -3593,7 +3587,54 @@ fn copy_dir_recursive(source: &Path, destination: &Path) -> Result<()> {
 }
 
 async fn run_command(command: Vec<String>, cwd: &Path, timeout_secs: u64) -> Result<ToolOutput> {
+    run_command_with_sandbox(command, cwd, timeout_secs, false).await
+}
+
+async fn run_shell_command(
+    command: &str,
+    cwd: &Path,
+    timeout_secs: u64,
+    sandbox: bool,
+) -> Result<ToolOutput> {
+    run_command_with_sandbox(
+        vec!["sh".to_string(), "-c".to_string(), command.to_string()],
+        cwd,
+        timeout_secs,
+        sandbox,
+    )
+    .await
+}
+
+async fn run_command_with_sandbox(
+    command: Vec<String>,
+    cwd: &Path,
+    timeout_secs: u64,
+    sandbox: bool,
+) -> Result<ToolOutput> {
     anyhow::ensure!(!command.is_empty(), "命令不能为空");
+    if sandbox {
+        let sandbox_dir = tempfile::Builder::new()
+            .prefix("yunzhi-sandbox-")
+            .tempdir()
+            .context("创建沙箱目录失败")?;
+        let workspace = sandbox_dir.path().join("workspace");
+        copy_workspace_for_sandbox(cwd, &workspace)?;
+        let mut output = run_command_in_dir(command, &workspace, timeout_secs).await?;
+        output.content = format!(
+            "sandbox: {}\n{}",
+            workspace.display(),
+            output.content.trim_start()
+        );
+        return Ok(output);
+    }
+    run_command_in_dir(command, cwd, timeout_secs).await
+}
+
+async fn run_command_in_dir(
+    command: Vec<String>,
+    cwd: &Path,
+    timeout_secs: u64,
+) -> Result<ToolOutput> {
     let started = Instant::now();
     let mut process = Command::new(&command[0]);
     process.args(&command[1..]).current_dir(cwd);
@@ -3623,6 +3664,25 @@ async fn run_command(command: Vec<String>, cwd: &Path, timeout_secs: u64) -> Res
         content: rendered,
         is_error: !output.status.success(),
     })
+}
+
+fn copy_workspace_for_sandbox(source: &Path, destination: &Path) -> Result<()> {
+    std::fs::create_dir_all(destination)?;
+    for path in searchable_files(source, source) {
+        let rel = path.strip_prefix(source).unwrap_or(&path);
+        let target = destination.join(rel);
+        if let Some(parent) = target.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&path, &target).with_context(|| {
+            format!(
+                "复制沙箱文件失败: {} -> {}",
+                path.display(),
+                target.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn parse_todo_status(raw: &str) -> Result<TodoStatus> {
@@ -3911,6 +3971,43 @@ mod tests {
             .await;
         assert!(!output.is_error, "{}", output.content);
         assert!(output.content.contains("yunzhi"));
+        assert!(output.content.contains("sandbox:"));
+    }
+
+    #[tokio::test]
+    async fn bash_runs_in_sandbox_by_default() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "bash",
+                json!({"command":"printf changed > original.txt"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("sandbox:"));
+        assert!(!dir.path().join("original.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn bash_can_run_in_workspace_when_sandbox_disabled() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "bash",
+                json!({"command":"printf changed > original.txt","sandbox":false}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("original.txt")).unwrap(),
+            "changed"
+        );
     }
 
     #[tokio::test]
