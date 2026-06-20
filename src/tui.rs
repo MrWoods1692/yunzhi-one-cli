@@ -100,15 +100,27 @@ impl PermissionPrompter for StdoutPrompter {
             println!("{}", "------------".dark_grey());
         }
         loop {
-            print!("确认执行? [y] 是 / [n] 否 / [a] 全部允许: ");
+            print!("确认执行? [y] 是 / [p] 选择 diff 块 / [n] 否 / [a] 全部允许: ");
             io::stdout().flush()?;
             let mut input = String::new();
             io::stdin().read_line(&mut input)?;
             match input.trim().to_lowercase().as_str() {
                 "y" | "yes" => return Ok(PermissionDecision::Allow),
                 "a" | "all" => return Ok(PermissionDecision::AllowAll),
+                "p" | "partial" => {
+                    print!("请输入要应用的 hunk 编号，例如 1,3-5: ");
+                    io::stdout().flush()?;
+                    let mut hunk_input = String::new();
+                    io::stdin().read_line(&mut hunk_input)?;
+                    match parse_hunk_selection(&hunk_input) {
+                        Ok(selected) if !selected.is_empty() => {
+                            return Ok(PermissionDecision::Partial(selected));
+                        }
+                        _ => println!("请输入有效的 hunk 编号。"),
+                    }
+                }
                 "n" | "no" => return Ok(PermissionDecision::Deny),
-                _ => println!("请输入 y、n 或 a。"),
+                _ => println!("请输入 y、p、n 或 a。"),
             }
         }
     }
@@ -178,4 +190,25 @@ impl PermissionPrompter for StdoutPrompter {
 
 pub fn ratatui_plan() -> &'static str {
     "进阶 TUI 将使用 ratatui + crossterm 拆分滚动消息区、固定输入框和状态栏；MVP 当前使用 stdout 流式渲染以保证核心 Agent 先可用。"
+}
+
+fn parse_hunk_selection(input: &str) -> Result<Vec<usize>> {
+    let mut selected = Vec::new();
+    for part in input
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+    {
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.trim().parse::<usize>()?;
+            let end = end.trim().parse::<usize>()?;
+            anyhow::ensure!(start <= end, "hunk 范围起点不能大于终点");
+            selected.extend(start..=end);
+        } else {
+            selected.push(part.parse::<usize>()?);
+        }
+    }
+    selected.sort_unstable();
+    selected.dedup();
+    Ok(selected)
 }

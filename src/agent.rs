@@ -16,6 +16,7 @@ const PLAN_READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
     "glob_search",
     "grep_search",
+    "code_index",
     "file_info",
     "ask_user",
     "choose_option",
@@ -29,6 +30,7 @@ const ANALYZE_READ_ONLY_TOOLS: &[&str] = &[
     "list_dir",
     "glob_search",
     "grep_search",
+    "code_index",
     "file_info",
     "ask_user",
     "choose_option",
@@ -514,6 +516,7 @@ mod tests {
     fn plan_read_only_tools_exclude_mutating_tools() {
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"code_index"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"ask_user"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"choose_option"));
         assert!(PLAN_READ_ONLY_TOOLS.contains(&"list_skills"));
@@ -529,6 +532,7 @@ mod tests {
     fn analyze_tools_are_read_only() {
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"read_file"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"code_index"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"ask_user"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"choose_option"));
         assert!(ANALYZE_READ_ONLY_TOOLS.contains(&"call_model"));

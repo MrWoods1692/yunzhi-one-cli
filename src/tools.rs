@@ -3,11 +3,12 @@ use crate::llm::ChatCompletionsClient;
 use crate::types::{ToolDefinition, ToolOutput};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use glob::glob;
+use glob::Pattern;
+use ignore::WalkBuilder;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use similar::{ChangeTag, TextDiff};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Cursor, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -15,12 +16,12 @@ use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::process::Command;
 use tokio::time::timeout;
-use walkdir::WalkDir;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PermissionDecision {
     Allow,
     AllowAll,
+    Partial(Vec<usize>),
     Deny,
 }
 
@@ -92,19 +93,20 @@ impl ToolContext {
         }
     }
 
-    pub async fn confirm(&mut self, request: PermissionRequest) -> Result<()> {
+    pub async fn confirm(&mut self, request: PermissionRequest) -> Result<PermissionDecision> {
         if self.dangerously_skip_permissions || self.allow_all {
-            return Ok(());
+            return Ok(PermissionDecision::Allow);
         }
         if self.auto_approve_safe && is_safe_operation(&request.tool_name) {
-            return Ok(());
+            return Ok(PermissionDecision::Allow);
         }
         match self.prompter.confirm(request).await? {
-            PermissionDecision::Allow => Ok(()),
+            PermissionDecision::Allow => Ok(PermissionDecision::Allow),
             PermissionDecision::AllowAll => {
                 self.allow_all = true;
-                Ok(())
+                Ok(PermissionDecision::AllowAll)
             }
+            PermissionDecision::Partial(hunks) => Ok(PermissionDecision::Partial(hunks)),
             PermissionDecision::Deny => anyhow::bail!("用户拒绝执行该工具"),
         }
     }
@@ -194,6 +196,7 @@ impl ToolRegistry {
         registry.register(BashTool);
         registry.register(GlobSearchTool);
         registry.register(GrepSearchTool);
+        registry.register(CodeIndexTool);
         registry.register(ListDirTool);
         registry.register(ListModelsTool);
         registry.register(ListSkillsTool);
@@ -324,19 +327,322 @@ fn normalize_path(path: &Path) -> PathBuf {
     output
 }
 
-fn diff_text(old: &str, new: &str) -> String {
+#[derive(Debug, Clone)]
+pub struct DiffHunk {
+    pub index: usize,
+    pub old_range: (usize, usize),
+    pub new_range: (usize, usize),
+    pub old_text: String,
+    pub new_text: String,
+    pub diff: String,
+}
+
+fn diff_hunks(old: &str, new: &str) -> Vec<DiffHunk> {
     let diff = TextDiff::from_lines(old, new);
-    let mut rendered = String::new();
-    for change in diff.iter_all_changes() {
-        let sign = match change.tag() {
-            ChangeTag::Delete => "-",
-            ChangeTag::Insert => "+",
-            ChangeTag::Equal => " ",
-        };
-        rendered.push_str(sign);
-        rendered.push_str(change.value());
+    let mut hunks = Vec::new();
+    for (index, group) in diff.grouped_ops(3).into_iter().enumerate() {
+        let mut old_text = String::new();
+        let mut new_text = String::new();
+        let mut rendered = String::new();
+        let mut old_start = usize::MAX;
+        let mut old_end = 0usize;
+        let mut new_start = usize::MAX;
+        let mut new_end = 0usize;
+
+        for op in group {
+            for change in diff.iter_changes(&op) {
+                let sign = match change.tag() {
+                    ChangeTag::Delete => "-",
+                    ChangeTag::Insert => "+",
+                    ChangeTag::Equal => " ",
+                };
+                rendered.push_str(sign);
+                rendered.push_str(change.value());
+                match change.tag() {
+                    ChangeTag::Delete => {
+                        old_start = old_start.min(change.old_index().unwrap_or(0));
+                        old_end = old_end.max(change.old_index().unwrap_or(0) + 1);
+                        old_text.push_str(change.value());
+                    }
+                    ChangeTag::Insert => {
+                        new_start = new_start.min(change.new_index().unwrap_or(0));
+                        new_end = new_end.max(change.new_index().unwrap_or(0) + 1);
+                        new_text.push_str(change.value());
+                    }
+                    ChangeTag::Equal => {
+                        if let Some(old_index) = change.old_index() {
+                            old_start = old_start.min(old_index);
+                            old_end = old_end.max(old_index + 1);
+                        }
+                        if let Some(new_index) = change.new_index() {
+                            new_start = new_start.min(new_index);
+                            new_end = new_end.max(new_index + 1);
+                        }
+                        old_text.push_str(change.value());
+                        new_text.push_str(change.value());
+                    }
+                }
+            }
+        }
+
+        if old_start == usize::MAX {
+            old_start = old_end;
+        }
+        if new_start == usize::MAX {
+            new_start = new_end;
+        }
+        hunks.push(DiffHunk {
+            index: index + 1,
+            old_range: (old_start, old_end),
+            new_range: (new_start, new_end),
+            old_text,
+            new_text,
+            diff: rendered,
+        });
     }
-    rendered
+    hunks
+}
+
+fn format_diff_hunks(hunks: &[DiffHunk]) -> String {
+    hunks
+        .iter()
+        .map(|hunk| {
+            format!(
+                "@@ hunk {} -{},{} +{},{} @@\n{}",
+                hunk.index,
+                hunk.old_range.0 + 1,
+                hunk.old_range.1.saturating_sub(hunk.old_range.0),
+                hunk.new_range.0 + 1,
+                hunk.new_range.1.saturating_sub(hunk.new_range.0),
+                hunk.diff
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn apply_selected_hunks(old: &str, hunks: &[DiffHunk], selected: &[usize]) -> String {
+    if selected.is_empty() {
+        return old.to_string();
+    }
+    let selected = selected.iter().copied().collect::<HashSet<_>>();
+    let mut output = String::new();
+    let mut cursor = 0usize;
+    for hunk in hunks {
+        let start = old_line_to_byte(old, hunk.old_range.0);
+        let end = old_line_to_byte(old, hunk.old_range.1);
+        if cursor < start {
+            output.push_str(&old[cursor..start]);
+        }
+        if selected.contains(&hunk.index) {
+            output.push_str(&hunk.new_text);
+        } else {
+            output.push_str(&old[start..end]);
+        }
+        cursor = end;
+    }
+    output.push_str(&old[cursor..]);
+    output
+}
+
+fn old_line_to_byte(text: &str, line_index: usize) -> usize {
+    if line_index == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .filter_map(|(index, ch)| (ch == '\n').then_some(index + 1))
+        .nth(line_index - 1)
+        .unwrap_or(text.len())
+}
+
+async fn confirm_text_write(
+    context: &mut ToolContext,
+    tool_name: &str,
+    summary: String,
+    old: &str,
+    new: String,
+) -> Result<String> {
+    let hunks = diff_hunks(old, &new);
+    if hunks.is_empty() {
+        return Ok(new);
+    }
+    let decision = context
+        .confirm(PermissionRequest {
+            tool_name: tool_name.to_string(),
+            summary,
+            diff: Some(format_diff_hunks(&hunks)),
+        })
+        .await?;
+    match decision {
+        PermissionDecision::Partial(selected) => Ok(apply_selected_hunks(old, &hunks, &selected)),
+        _ => Ok(new),
+    }
+}
+
+const DEFAULT_IGNORED_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".next",
+    "dist",
+    "build",
+    ".cache",
+    ".venv",
+    "venv",
+];
+const MAX_INDEXED_FILE_BYTES: u64 = 1_000_000;
+
+fn is_default_ignored_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        let value = component.as_os_str().to_string_lossy();
+        DEFAULT_IGNORED_DIRS.iter().any(|ignored| value == *ignored)
+    })
+}
+
+fn searchable_files(root: &Path, cwd: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    for entry in WalkBuilder::new(root)
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .filter_entry(|entry| !is_default_ignored_path(entry.path()))
+        .build()
+        .filter_map(Result::ok)
+    {
+        let path = entry.path();
+        if !path.is_file() || is_default_ignored_path(path) {
+            continue;
+        }
+        if !normalize_path(path).starts_with(&normalize_path(cwd)) {
+            continue;
+        }
+        let Ok(metadata) = std::fs::metadata(path) else {
+            continue;
+        };
+        if metadata.len() > MAX_INDEXED_FILE_BYTES {
+            continue;
+        }
+        files.push(path.to_path_buf());
+    }
+    files
+}
+
+fn is_text_like(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some(
+            "rs" | "toml"
+                | "md"
+                | "txt"
+                | "json"
+                | "yaml"
+                | "yml"
+                | "js"
+                | "ts"
+                | "tsx"
+                | "jsx"
+                | "py"
+                | "go"
+                | "java"
+                | "c"
+                | "h"
+                | "cpp"
+                | "hpp"
+                | "cs"
+                | "html"
+                | "css"
+                | "scss"
+                | "sql"
+                | "sh"
+        )
+    )
+}
+
+#[derive(Debug, Clone)]
+struct CodeSymbol {
+    kind: &'static str,
+    name: String,
+    line: usize,
+}
+
+impl CodeSymbol {
+    fn matches_query(&self, query: Option<&str>) -> bool {
+        query.is_none_or(|query| self.name.to_lowercase().contains(query))
+    }
+}
+
+fn extract_symbols(path: &Path, content: &str) -> Vec<CodeSymbol> {
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("");
+    let mut symbols = Vec::new();
+    for (line_index, line) in content.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let candidates: &[(&str, &str)] = match extension {
+            "rs" => &[
+                ("fn", "function"),
+                ("pub fn", "function"),
+                ("struct", "type"),
+                ("pub struct", "type"),
+                ("enum", "type"),
+                ("pub enum", "type"),
+                ("trait", "trait"),
+                ("impl", "impl"),
+            ],
+            "ts" | "tsx" | "js" | "jsx" => &[
+                ("function", "function"),
+                ("export function", "function"),
+                ("class", "type"),
+                ("export class", "type"),
+                ("interface", "type"),
+                ("export interface", "type"),
+                ("const", "value"),
+                ("export const", "value"),
+            ],
+            "py" => &[("def", "function"), ("class", "type")],
+            "go" => &[("func", "function"), ("type", "type")],
+            _ => &[],
+        };
+        for (prefix, kind) in candidates {
+            if let Some(name) = symbol_name_after_prefix(trimmed, prefix) {
+                symbols.push(CodeSymbol {
+                    kind,
+                    name,
+                    line: line_index + 1,
+                });
+                break;
+            }
+        }
+    }
+    symbols
+}
+
+fn symbol_name_after_prefix(line: &str, prefix: &str) -> Option<String> {
+    let rest = line.strip_prefix(prefix)?.trim_start();
+    let rest = rest.strip_prefix("async ").unwrap_or(rest).trim_start();
+    let rest = rest.strip_prefix("unsafe ").unwrap_or(rest).trim_start();
+    let name = rest
+        .trim_start_matches(|ch: char| ch == '<' || ch.is_whitespace())
+        .chars()
+        .take_while(|ch| ch.is_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    (!name.is_empty()).then_some(name)
+}
+
+fn format_code_index_file(path: &str, symbols: &[CodeSymbol]) -> String {
+    if symbols.is_empty() {
+        return format!("file\t{path}");
+    }
+    let rendered_symbols = symbols
+        .iter()
+        .take(20)
+        .map(|symbol| format!("{}:{}:{}", symbol.kind, symbol.name, symbol.line))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("file\t{path}\t{rendered_symbols}")
 }
 
 async fn write_text_file_with_confirmation(
@@ -347,13 +653,7 @@ async fn write_text_file_with_confirmation(
     summary: String,
 ) -> Result<ToolOutput> {
     let old = tokio::fs::read_to_string(path).await.unwrap_or_default();
-    context
-        .confirm(PermissionRequest {
-            tool_name: tool_name.to_string(),
-            summary,
-            diff: Some(diff_text(&old, &content)),
-        })
-        .await?;
+    let content = confirm_text_write(context, tool_name, summary, &old, content).await?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).await?;
     }
@@ -430,14 +730,14 @@ impl Tool for WriteFileTool {
         let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
         let content = string_arg(&args, "content")?;
         let old = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        let diff = diff_text(&old, &content);
-        context
-            .confirm(PermissionRequest {
-                tool_name: self.name().to_string(),
-                summary: format!("写入文件 {}", path.display()),
-                diff: Some(diff),
-            })
-            .await?;
+        let content = confirm_text_write(
+            context,
+            self.name(),
+            format!("写入文件 {}", path.display()),
+            &old,
+            content,
+        )
+        .await?;
         if let Some(parent) = path.parent() {
             tokio::fs::create_dir_all(parent).await?;
         }
@@ -474,13 +774,14 @@ impl Tool for EditFileTool {
             "old_str 必须精确出现一次，当前出现 {matches} 次"
         );
         let new = old.replacen(&old_str, &new_str, 1);
-        context
-            .confirm(PermissionRequest {
-                tool_name: self.name().to_string(),
-                summary: format!("编辑文件 {}", path.display()),
-                diff: Some(diff_text(&old, &new)),
-            })
-            .await?;
+        let new = confirm_text_write(
+            context,
+            self.name(),
+            format!("编辑文件 {}", path.display()),
+            &old,
+            new,
+        )
+        .await?;
         tokio::fs::write(&path, new)
             .await
             .with_context(|| format!("写入文件失败: {}", path.display()))?;
@@ -507,13 +808,14 @@ impl Tool for AppendFileTool {
         let old = fs::read_to_string(&path).await.unwrap_or_default();
         let mut new = old.clone();
         new.push_str(&content);
-        context
-            .confirm(PermissionRequest {
-                tool_name: self.name().to_string(),
-                summary: format!("追加文件 {}", path.display()),
-                diff: Some(diff_text(&old, &new)),
-            })
-            .await?;
+        let new = confirm_text_write(
+            context,
+            self.name(),
+            format!("追加文件 {}", path.display()),
+            &old,
+            new,
+        )
+        .await?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).await?;
         }
@@ -773,17 +1075,12 @@ impl Tool for GlobSearchTool {
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
         let pattern = string_arg(&args, "pattern")?;
-        let absolute_pattern = context.cwd.join(pattern).to_string_lossy().to_string();
+        let matcher = Pattern::new(&pattern)?;
         let mut matches = Vec::new();
-        for entry in glob(&absolute_pattern)? {
-            let path = entry?;
-            if path.is_file() {
-                matches.push(
-                    path.strip_prefix(&context.cwd)
-                        .unwrap_or(&path)
-                        .display()
-                        .to_string(),
-                );
+        for path in searchable_files(&context.cwd, &context.cwd) {
+            let rel = path.strip_prefix(&context.cwd).unwrap_or(&path);
+            if matcher.matches_path(rel) {
+                matches.push(rel.display().to_string());
             }
             if matches.len() >= 200 {
                 break;
@@ -814,23 +1111,16 @@ impl Tool for GrepSearchTool {
             None => context.cwd.clone(),
         };
         let mut lines = Vec::new();
-        for entry in WalkDir::new(root)
-            .into_iter()
-            .filter_map(Result::ok)
-            .filter(|entry| entry.file_type().is_file())
-        {
-            let path = entry.path();
-            if path.components().any(|component| {
-                component.as_os_str() == "target" || component.as_os_str() == ".git"
-            }) {
+        for path in searchable_files(&root, &context.cwd) {
+            if !is_text_like(&path) {
                 continue;
             }
-            let Ok(content) = std::fs::read_to_string(path) else {
+            let Ok(content) = std::fs::read_to_string(&path) else {
                 continue;
             };
             for (line_number, line) in content.lines().enumerate() {
                 if line.contains(&pattern) {
-                    let rel = path.strip_prefix(&context.cwd).unwrap_or(path).display();
+                    let rel = path.strip_prefix(&context.cwd).unwrap_or(&path).display();
                     lines.push(format!("{}:{}:{}", rel, line_number + 1, line));
                     if lines.len() >= 200 {
                         return Ok(ToolOutput::ok(lines.join("\n")));
@@ -839,6 +1129,103 @@ impl Tool for GrepSearchTool {
             }
         }
         Ok(ToolOutput::ok(lines.join("\n")))
+    }
+}
+
+struct CodeIndexTool;
+
+#[async_trait]
+impl Tool for CodeIndexTool {
+    fn name(&self) -> &'static str {
+        "code_index"
+    }
+
+    fn description(&self) -> &'static str {
+        "构建轻量代码索引：尊重 .gitignore 与大文件过滤，支持按查询返回相关文件、符号和引用"
+    }
+
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "query":{"type":"string","description":"可选，按名称或文本过滤文件、符号和引用"},
+                "path":{"type":"string","description":"可选，索引子目录，默认当前目录"},
+                "limit":{"type":"integer","description":"返回数量上限，默认 100，最大 500"},
+                "include_references":{"type":"boolean","description":"是否返回文本引用，默认 true"}
+            }
+        })
+    }
+
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let root = match args.get("path").and_then(Value::as_str) {
+            Some(path) => resolve_path(&context.cwd, path)?,
+            None => context.cwd.clone(),
+        };
+        let query = optional_string_arg(&args, "query").map(|value| value.to_lowercase());
+        let limit = optional_u64_arg(&args, "limit", 100).clamp(1, 500) as usize;
+        let include_references = bool_arg(&args, "include_references", true);
+        let files = searchable_files(&root, &context.cwd);
+        let mut records = Vec::new();
+        let mut skipped_binary = 0usize;
+
+        for path in files {
+            if !is_text_like(&path) {
+                skipped_binary += 1;
+                continue;
+            }
+            let rel = path
+                .strip_prefix(&context.cwd)
+                .unwrap_or(&path)
+                .display()
+                .to_string();
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                skipped_binary += 1;
+                continue;
+            };
+            let symbols = extract_symbols(&path, &content);
+            let file_matches = query
+                .as_ref()
+                .is_none_or(|query| rel.to_lowercase().contains(query));
+            if query.is_none()
+                || file_matches
+                || symbols
+                    .iter()
+                    .any(|symbol| symbol.matches_query(query.as_deref()))
+            {
+                records.push(format_code_index_file(&rel, &symbols));
+                if records.len() >= limit {
+                    break;
+                }
+            }
+            if include_references {
+                if let Some(query) = query.as_deref() {
+                    for (line_number, line) in content.lines().enumerate() {
+                        if line.to_lowercase().contains(query) {
+                            records.push(format!(
+                                "ref\t{}:{}\t{}",
+                                rel,
+                                line_number + 1,
+                                line.trim()
+                            ));
+                            if records.len() >= limit {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            if records.len() >= limit {
+                break;
+            }
+        }
+
+        let mut output = format!(
+            "indexed_records: {}\nskipped_non_text_or_unreadable: {}\n\n",
+            records.len(),
+            skipped_binary
+        );
+        output.push_str(&records.join("\n"));
+        Ok(ToolOutput::ok(output.trim_end().to_string()))
     }
 }
 
@@ -3387,6 +3774,54 @@ mod tests {
             )
             .await;
         assert!(output.is_error);
+    }
+
+    #[test]
+    fn applies_selected_diff_hunks_only() {
+        let old = "one\na\nb\nc\nd\ne\nf\ng\nthree\n";
+        let new = "ONE\na\nb\nc\nd\ne\nf\ng\nTHREE\n";
+        let hunks = diff_hunks(old, new);
+        assert_eq!(hunks.len(), 2);
+        let applied = apply_selected_hunks(old, &hunks, &[2]);
+        assert_eq!(applied, "one\na\nb\nc\nd\ne\nf\ng\nTHREE\n");
+    }
+
+    #[tokio::test]
+    async fn search_respects_gitignore_and_default_ignored_dirs() {
+        let dir = tempdir().unwrap();
+        std::fs::write(dir.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        std::fs::write(dir.path().join("visible.txt"), "needle\n").unwrap();
+        std::fs::write(dir.path().join("ignored.txt"), "needle\n").unwrap();
+        std::fs::create_dir_all(dir.path().join("target")).unwrap();
+        std::fs::write(dir.path().join("target/generated.txt"), "needle\n").unwrap();
+
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute("grep_search", json!({"pattern":"needle"}), &mut ctx)
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("visible.txt"));
+        assert!(!output.content.contains("ignored.txt"));
+        assert!(!output.content.contains("target/generated.txt"));
+    }
+
+    #[tokio::test]
+    async fn code_index_reports_symbols_and_references() {
+        let dir = tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub struct Agent {}\nfn run_agent() {}\nfn other() { run_agent(); }\n",
+        )
+        .unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute("code_index", json!({"query":"run_agent"}), &mut ctx)
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        assert!(output.content.contains("function:run_agent:2"));
+        assert!(output.content.contains("ref\tlib.rs:3"));
     }
 
     #[tokio::test]
