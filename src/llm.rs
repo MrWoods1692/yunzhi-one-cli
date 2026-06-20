@@ -68,6 +68,7 @@ impl ChatCompletionsClient {
             stream: false,
             messages,
             tools: Vec::new(),
+            tool_choice: None,
         };
         let response = self.send_json(body).await?;
         let value: Value = response.json().await.context("解析模型响应失败")?;
@@ -98,6 +99,8 @@ struct ChatCompletionsRequest<'a> {
     messages: Vec<ChatMessage>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tools: Vec<ChatTool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<&'static str>,
 }
 
 #[derive(Debug, Serialize)]
@@ -220,6 +223,7 @@ impl ChatCompletionsClient {
             stream: true,
             messages: to_chat_messages(request.system.as_deref(), &request.messages),
             tools: request.tools.iter().map(to_chat_tool).collect(),
+            tool_choice: (!request.tools.is_empty()).then_some("auto"),
         };
         self.send_json(body).await
     }
@@ -470,5 +474,26 @@ mod tests {
         assert_eq!(mapped["type"], "function");
         assert_eq!(mapped["function"]["name"], "read_file");
         assert_eq!(mapped["function"]["parameters"]["type"], "object");
+    }
+
+    #[test]
+    fn serializes_tool_choice_auto_when_tools_exist() {
+        let body = ChatCompletionsRequest {
+            model: "Claude-Opus-4.6",
+            max_tokens: 4096,
+            stream: true,
+            messages: Vec::new(),
+            tools: vec![ChatTool {
+                tool_type: "function",
+                function: ChatToolFunction {
+                    name: "write_file".to_string(),
+                    description: "写入文件".to_string(),
+                    parameters: json!({"type":"object"}),
+                },
+            }],
+            tool_choice: Some("auto"),
+        };
+        let value = serde_json::to_value(body).unwrap();
+        assert_eq!(value["tool_choice"], "auto");
     }
 }

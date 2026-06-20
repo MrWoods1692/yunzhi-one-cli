@@ -74,6 +74,7 @@ impl<C: LlmClient> Agent<C> {
         self.compress_if_needed();
         let started = Instant::now();
         let mut final_text = String::new();
+        let mut tool_call_count = 0;
 
         loop {
             let request = ChatRequest {
@@ -123,11 +124,15 @@ impl<C: LlmClient> Agent<C> {
             }
 
             if tool_calls.is_empty() {
+                if tool_call_count == 0 && looks_like_unverified_completion(&final_text) {
+                    tui::print_unverified_completion_warning();
+                }
                 tui::print_agent_done(started.elapsed().as_secs_f32(), self.estimated_tokens());
                 return Ok(final_text);
             }
 
             for call in tool_calls {
+                tool_call_count += 1;
                 let summary = call.input.to_string();
                 let tool_started = Instant::now();
                 tui::print_tool_start(&call.name, &summary);
@@ -181,7 +186,29 @@ fn build_system_prompt(mode: AgentMode) -> Result<String> {
 }
 
 fn base_system_prompt() -> String {
-    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Claude-Opus-4.6。你可以调用工具读取、搜索、编辑文件、执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。修改文件、执行代码、运行程序、执行命令或危险系统操作前会请求用户确认。优先给出简洁、准确、可执行的回答。".to_string()
+    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Claude-Opus-4.6。你可以调用工具读取、搜索、编辑文件、执行命令、执行代码片段、运行程序、管理和跟踪代办任务、执行受控系统操作，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。凡是用户要求创建、修改、删除、读取文件，或要求执行命令/代码/程序，都必须调用对应工具完成；没有实际调用工具并收到工具结果前，禁止声称已经完成、已经创建、已经写入、已经运行或已经验证。修改文件、执行代码、运行程序、执行命令或危险系统操作前会请求用户确认。优先给出简洁、准确、可执行的回答。".to_string()
+}
+
+fn looks_like_unverified_completion(text: &str) -> bool {
+    let ascii = text.to_ascii_lowercase();
+    let words = [
+        "完成",
+        "已创建",
+        "已新建",
+        "已写入",
+        "已修改",
+        "已执行",
+        "已运行",
+        "操作完成",
+        "done",
+        "created",
+        "written",
+        "modified",
+        "executed",
+    ];
+    words
+        .iter()
+        .any(|word| text.contains(word) || ascii.contains(word))
 }
 
 fn mode_prompt(mode: AgentMode) -> &'static str {

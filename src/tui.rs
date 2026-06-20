@@ -69,6 +69,13 @@ pub fn print_tool_done(success: bool, elapsed_secs: f32) {
     println!("└ {} ({:.1}s)\n", mark, elapsed_secs);
 }
 
+pub fn print_unverified_completion_warning() {
+    println!(
+        "\n{} 模型声称操作完成，但本轮没有检测到工具调用；文件或命令可能没有真正执行。\n",
+        "警告".yellow().bold()
+    );
+}
+
 pub struct StdoutPrompter;
 
 #[async_trait]

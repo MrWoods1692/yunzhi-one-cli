@@ -125,6 +125,7 @@ async fn run_interactive(dangerously_skip_permissions: bool, mode: AgentMode) ->
     let mut agent = build_agent(dangerously_skip_permissions, mode).await?;
     println!("当前模式: {}。输入 /mode 查看或切换。\n", agent.mode());
     let mut editor = rustyline::DefaultEditor::new()?;
+    let mut last_request: Option<String> = None;
 
     loop {
         match editor.readline("yunzhi> ") {
@@ -154,7 +155,16 @@ async fn run_interactive(dangerously_skip_permissions: bool, mode: AgentMode) ->
                             continue;
                         }
                         tui::print_user(input);
-                        if let Err(error) = agent.run_turn(input.to_string()).await {
+                        let turn_input = if is_confirmation(input) {
+                            last_request
+                                .as_ref()
+                                .map(|request| format!("确认执行上一条请求: {request}"))
+                                .unwrap_or_else(|| input.to_string())
+                        } else {
+                            last_request = Some(input.to_string());
+                            input.to_string()
+                        };
+                        if let Err(error) = agent.run_turn(turn_input).await {
                             eprintln!("错误: {error:#}");
                         }
                     }
@@ -169,4 +179,11 @@ async fn run_interactive(dangerously_skip_permissions: bool, mode: AgentMode) ->
     }
 
     Ok(())
+}
+
+fn is_confirmation(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes" | "ok" | "okay" | "确认" | "可以" | "好" | "好的"
+    )
 }
