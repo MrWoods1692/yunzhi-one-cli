@@ -4,11 +4,13 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::StatusCode;
 use serde::Serialize;
-use serde_json::Value;
+use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use tokio::sync::mpsc;
 
 pub const DEFAULT_BASE_URL: &str = "https://yunzhiapi.cn/v1";
+pub const DEFAULT_MODEL: &str = "Claude-Opus-4.6";
 
 #[async_trait]
 pub trait LlmClient: Send + Sync {
@@ -19,13 +21,13 @@ pub trait LlmClient: Send + Sync {
 }
 
 #[derive(Debug, Clone)]
-pub struct AnthropicLikeClient {
+pub struct ChatCompletionsClient {
     http: reqwest::Client,
     base_url: String,
     api_key: String,
 }
 
-impl AnthropicLikeClient {
+impl ChatCompletionsClient {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self::with_base_url(DEFAULT_BASE_URL, api_key)
     }
@@ -37,7 +39,47 @@ impl AnthropicLikeClient {
             api_key: api_key.into(),
         }
     }
+
+    pub async fn complete_once(
+        &self,
+        model: &str,
+        system: Option<&str>,
+        prompt: &str,
+        max_tokens: u32,
+    ) -> Result<String> {
+        let mut messages = Vec::new();
+        if let Some(system) = system {
+            messages.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(system.to_string()),
+                tool_calls: None,
+                tool_call_id: None,
+            });
+        }
+        messages.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(prompt.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+        let body = ChatCompletionsRequest {
+            model,
+            max_tokens,
+            stream: false,
+            messages,
+            tools: Vec::new(),
+        };
+        let response = self.send_json(body).await?;
+        let value: Value = response.json().await.context("解析模型响应失败")?;
+        Ok(value
+            .pointer("/choices/0/message/content")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string())
+    }
 }
+
+pub type AnthropicLikeClient = ChatCompletionsClient;
 
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -49,29 +91,56 @@ pub struct ChatRequest {
 }
 
 #[derive(Debug, Serialize)]
-struct ApiRequest<'a> {
+struct ChatCompletionsRequest<'a> {
     model: &'a str,
     max_tokens: u32,
     stream: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    system: Option<&'a str>,
-    messages: Vec<ApiMessage<'a>>,
-    #[serde(skip_serializing_if = "is_empty_tools")]
-    tools: &'a [ToolDefinition],
-}
-
-fn is_empty_tools(tools: &[ToolDefinition]) -> bool {
-    tools.is_empty()
+    messages: Vec<ChatMessage>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tools: Vec<ChatTool>,
 }
 
 #[derive(Debug, Serialize)]
-struct ApiMessage<'a> {
-    role: &'a str,
-    content: &'a [ContentBlock],
+struct ChatMessage {
+    role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ChatToolCall>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatTool {
+    #[serde(rename = "type")]
+    tool_type: &'static str,
+    function: ChatToolFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatToolFunction {
+    name: String,
+    description: String,
+    parameters: Value,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatToolCall {
+    id: String,
+    #[serde(rename = "type")]
+    call_type: &'static str,
+    function: ChatToolCallFunction,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatToolCallFunction {
+    name: String,
+    arguments: String,
 }
 
 #[async_trait]
-impl LlmClient for AnthropicLikeClient {
+impl LlmClient for ChatCompletionsClient {
     async fn stream_messages(
         &self,
         request: ChatRequest,
@@ -82,7 +151,7 @@ impl LlmClient for AnthropicLikeClient {
 
         tokio::spawn(async move {
             let mut buffer = String::new();
-            let mut pending_tool: Option<PendingTool> = None;
+            let mut pending_tools = BTreeMap::new();
 
             while let Some(chunk) = bytes_stream.next().await {
                 let chunk = match chunk {
@@ -100,17 +169,18 @@ impl LlmClient for AnthropicLikeClient {
                     if raw_event.trim().is_empty() {
                         continue;
                     }
-                    match parse_sse_event(&raw_event, &mut pending_tool) {
-                        Ok(Some(event)) => {
-                            let stop = matches!(event, StreamEvent::MessageStop);
-                            if tx.send(Ok(event)).await.is_err() {
-                                return;
-                            }
-                            if stop {
-                                return;
+                    match parse_sse_event(&raw_event, &mut pending_tools) {
+                        Ok(events) => {
+                            for event in events {
+                                let stop = matches!(event, StreamEvent::MessageStop);
+                                if tx.send(Ok(event)).await.is_err() {
+                                    return;
+                                }
+                                if stop {
+                                    return;
+                                }
                             }
                         }
-                        Ok(None) => {}
                         Err(error) => {
                             let _ = tx.send(Err(error)).await;
                             return;
@@ -126,7 +196,7 @@ impl LlmClient for AnthropicLikeClient {
     }
 }
 
-impl AnthropicLikeClient {
+impl ChatCompletionsClient {
     async fn send_with_retry(&self, request: &ChatRequest) -> Result<reqwest::Response> {
         let mut last_error = None;
         for attempt in 0..3 {
@@ -144,35 +214,22 @@ impl AnthropicLikeClient {
     }
 
     async fn send_once(&self, request: &ChatRequest) -> Result<reqwest::Response> {
-        let messages = request
-            .messages
-            .iter()
-            .filter(|message| !matches!(message.role, crate::types::Role::System))
-            .map(|message| ApiMessage {
-                role: match message.role {
-                    crate::types::Role::User | crate::types::Role::Tool => "user",
-                    crate::types::Role::Assistant => "assistant",
-                    crate::types::Role::System => "user",
-                },
-                content: &message.content,
-            })
-            .collect::<Vec<_>>();
-
-        let body = ApiRequest {
+        let body = ChatCompletionsRequest {
             model: &request.model,
             max_tokens: request.max_tokens,
             stream: true,
-            system: request.system.as_deref(),
-            messages,
-            tools: &request.tools,
+            messages: to_chat_messages(request.system.as_deref(), &request.messages),
+            tools: request.tools.iter().map(to_chat_tool).collect(),
         };
+        self.send_json(body).await
+    }
 
+    async fn send_json(&self, body: ChatCompletionsRequest<'_>) -> Result<reqwest::Response> {
         let response = self
             .http
-            .post(format!("{}/messages", self.base_url))
+            .post(format!("{}/chat/completions", self.base_url))
             .header("x-api-key", &self.api_key)
             .bearer_auth(&self.api_key)
-            .header("anthropic-version", "2023-06-01")
             .json(&body)
             .send()
             .await
@@ -193,17 +250,112 @@ impl AnthropicLikeClient {
     }
 }
 
-#[derive(Debug, Clone)]
+fn to_chat_tool(definition: &ToolDefinition) -> ChatTool {
+    ChatTool {
+        tool_type: "function",
+        function: ChatToolFunction {
+            name: definition.name.clone(),
+            description: definition.description.clone(),
+            parameters: definition.input_schema.clone(),
+        },
+    }
+}
+
+fn to_chat_messages(system: Option<&str>, messages: &[Message]) -> Vec<ChatMessage> {
+    let mut output = Vec::new();
+    if let Some(system) = system {
+        output.push(ChatMessage {
+            role: "system".to_string(),
+            content: Some(system.to_string()),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    for message in messages {
+        match message.role {
+            crate::types::Role::System => output.push(ChatMessage {
+                role: "system".to_string(),
+                content: Some(message.text()),
+                tool_calls: None,
+                tool_call_id: None,
+            }),
+            crate::types::Role::User => append_user_or_tool_messages(&mut output, message),
+            crate::types::Role::Tool => append_user_or_tool_messages(&mut output, message),
+            crate::types::Role::Assistant => output.push(assistant_message(message)),
+        }
+    }
+    output
+}
+
+fn append_user_or_tool_messages(output: &mut Vec<ChatMessage>, message: &Message) {
+    let mut text_parts = Vec::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+                is_error,
+            } => output.push(ChatMessage {
+                role: "tool".to_string(),
+                content: Some(if *is_error {
+                    format!("ERROR: {content}")
+                } else {
+                    content.clone()
+                }),
+                tool_calls: None,
+                tool_call_id: Some(tool_use_id.clone()),
+            }),
+            ContentBlock::ToolUse { .. } => {}
+        }
+    }
+    if !text_parts.is_empty() {
+        output.push(ChatMessage {
+            role: "user".to_string(),
+            content: Some(text_parts.join("\n")),
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+}
+
+fn assistant_message(message: &Message) -> ChatMessage {
+    let mut text_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+    for block in &message.content {
+        match block {
+            ContentBlock::Text { text } => text_parts.push(text.clone()),
+            ContentBlock::ToolUse { id, name, input } => tool_calls.push(ChatToolCall {
+                id: id.clone(),
+                call_type: "function",
+                function: ChatToolCallFunction {
+                    name: name.clone(),
+                    arguments: input.to_string(),
+                },
+            }),
+            ContentBlock::ToolResult { .. } => {}
+        }
+    }
+    ChatMessage {
+        role: "assistant".to_string(),
+        content: (!text_parts.is_empty()).then(|| text_parts.join("\n")),
+        tool_calls: (!tool_calls.is_empty()).then_some(tool_calls),
+        tool_call_id: None,
+    }
+}
+
+#[derive(Debug, Clone, Default)]
 struct PendingTool {
     id: String,
     name: String,
-    input_json: String,
+    arguments: String,
 }
 
 fn parse_sse_event(
     raw: &str,
-    pending_tool: &mut Option<PendingTool>,
-) -> Result<Option<StreamEvent>> {
+    pending_tools: &mut BTreeMap<usize, PendingTool>,
+) -> Result<Vec<StreamEvent>> {
     let data = raw
         .lines()
         .filter_map(|line| line.strip_prefix("data:"))
@@ -211,67 +363,78 @@ fn parse_sse_event(
         .collect::<Vec<_>>()
         .join("\n");
 
-    if data.is_empty() || data == "[DONE]" {
-        return Ok(Some(StreamEvent::MessageStop));
+    if data.is_empty() {
+        return Ok(Vec::new());
+    }
+    if data == "[DONE]" {
+        return Ok(finish_pending_tools(pending_tools));
     }
 
     let value: Value =
         serde_json::from_str(&data).with_context(|| format!("解析 SSE 数据失败: {data}"))?;
-    let event_type = value
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default();
-
-    match event_type {
-        "content_block_start" => {
-            if value.pointer("/content_block/type").and_then(Value::as_str) == Some("tool_use") {
-                *pending_tool = Some(PendingTool {
-                    id: value
-                        .pointer("/content_block/id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    name: value
-                        .pointer("/content_block/name")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string(),
-                    input_json: String::new(),
-                });
-            }
-            Ok(None)
-        }
-        "content_block_delta" => {
-            if let Some(text) = value.pointer("/delta/text").and_then(Value::as_str) {
-                return Ok(Some(StreamEvent::TextDelta(text.to_string())));
-            }
-            if let Some(partial_json) = value.pointer("/delta/partial_json").and_then(Value::as_str)
-            {
-                if let Some(tool) = pending_tool.as_mut() {
-                    tool.input_json.push_str(partial_json);
-                }
-            }
-            Ok(None)
-        }
-        "content_block_stop" => {
-            if let Some(tool) = pending_tool.take() {
-                let input = if tool.input_json.trim().is_empty() {
-                    Value::Object(Default::default())
-                } else {
-                    serde_json::from_str(&tool.input_json).context("解析工具调用参数失败")?
-                };
-                return Ok(Some(StreamEvent::ToolUse(ToolCall {
-                    id: tool.id,
-                    name: tool.name,
-                    input,
-                })));
-            }
-            Ok(None)
-        }
-        "message_stop" => Ok(Some(StreamEvent::MessageStop)),
-        "error" => anyhow::bail!("云智 API 流式错误: {}", value),
-        _ => Ok(None),
+    if let Some(error) = value.get("error") {
+        anyhow::bail!("云智 API 流式错误: {}", error);
     }
+
+    let mut events = Vec::new();
+    let Some(choice) = value.pointer("/choices/0") else {
+        return Ok(events);
+    };
+    let delta = choice.get("delta").unwrap_or(&Value::Null);
+    if let Some(content) = delta.get("content").and_then(Value::as_str) {
+        if !content.is_empty() {
+            events.push(StreamEvent::TextDelta(content.to_string()));
+        }
+    }
+    if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+        for tool_call in tool_calls {
+            let index = tool_call.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+            let pending = pending_tools.entry(index).or_default();
+            if let Some(id) = tool_call.get("id").and_then(Value::as_str) {
+                pending.id = id.to_string();
+            }
+            if let Some(name) = tool_call.pointer("/function/name").and_then(Value::as_str) {
+                pending.name = name.to_string();
+            }
+            if let Some(arguments) = tool_call
+                .pointer("/function/arguments")
+                .and_then(Value::as_str)
+            {
+                pending.arguments.push_str(arguments);
+            }
+        }
+    }
+    if choice.get("finish_reason").and_then(Value::as_str) == Some("tool_calls") {
+        events.extend(finish_pending_tools(pending_tools));
+    } else if choice.get("finish_reason").and_then(Value::as_str) == Some("stop") {
+        events.push(StreamEvent::MessageStop);
+    }
+    Ok(events)
+}
+
+fn finish_pending_tools(pending_tools: &mut BTreeMap<usize, PendingTool>) -> Vec<StreamEvent> {
+    let mut events = Vec::new();
+    for (_, tool) in std::mem::take(pending_tools) {
+        let input = if tool.arguments.trim().is_empty() {
+            json!({})
+        } else {
+            serde_json::from_str(&tool.arguments)
+                .unwrap_or_else(|_| json!({ "raw_arguments": tool.arguments }))
+        };
+        events.push(StreamEvent::ToolUse(ToolCall {
+            id: if tool.id.is_empty() {
+                format!("tool_{}", events.len())
+            } else {
+                tool.id
+            },
+            name: tool.name,
+            input,
+        }));
+    }
+    if events.is_empty() {
+        events.push(StreamEvent::MessageStop);
+    }
+    events
 }
 
 #[cfg(test)]
@@ -279,23 +442,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_text_delta() {
-        let mut pending = None;
-        let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n";
-        let event = parse_sse_event(raw, &mut pending).unwrap().unwrap();
-        assert!(matches!(event, StreamEvent::TextDelta(text) if text == "hi"));
+    fn parses_chat_text_delta() {
+        let mut pending = BTreeMap::new();
+        let raw = "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\n";
+        let events = parse_sse_event(raw, &mut pending).unwrap();
+        assert!(matches!(&events[0], StreamEvent::TextDelta(text) if text == "hi"));
     }
 
     #[test]
-    fn parses_tool_use() {
-        let mut pending = None;
-        parse_sse_event("data: {\"type\":\"content_block_start\",\"content_block\":{\"type\":\"tool_use\",\"id\":\"t1\",\"name\":\"read_file\"}}\n", &mut pending).unwrap();
-        parse_sse_event("data: {\"type\":\"content_block_delta\",\"delta\":{\"partial_json\":\"{\\\"path\\\":\\\"README.md\\\"}\"}}\n", &mut pending).unwrap();
-        let event = parse_sse_event("data: {\"type\":\"content_block_stop\"}\n", &mut pending)
-            .unwrap()
-            .unwrap();
+    fn parses_chat_tool_call() {
+        let mut pending = BTreeMap::new();
+        parse_sse_event("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"type\":\"function\",\"function\":{\"name\":\"read_file\",\"arguments\":\"{\\\"path\\\":\"}}]}}]}\n", &mut pending).unwrap();
+        let events = parse_sse_event("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"README.md\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n", &mut pending).unwrap();
         assert!(
-            matches!(event, StreamEvent::ToolUse(call) if call.name == "read_file" && call.input["path"] == "README.md")
+            matches!(&events[0], StreamEvent::ToolUse(call) if call.name == "read_file" && call.input["path"] == "README.md")
         );
+    }
+
+    #[test]
+    fn maps_tools_to_chat_completions_shape() {
+        let tool = ToolDefinition {
+            name: "read_file".to_string(),
+            description: "读取文件".to_string(),
+            input_schema: json!({"type":"object"}),
+        };
+        let mapped = serde_json::to_value(to_chat_tool(&tool)).unwrap();
+        assert_eq!(mapped["type"], "function");
+        assert_eq!(mapped["function"]["name"], "read_file");
+        assert_eq!(mapped["function"]["parameters"]["type"], "object");
     }
 }

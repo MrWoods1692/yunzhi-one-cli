@@ -1,3 +1,4 @@
+use crate::llm::ChatCompletionsClient;
 use crate::types::{ToolDefinition, ToolOutput};
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -34,6 +35,7 @@ pub struct PermissionRequest {
 #[derive(Clone)]
 pub struct ToolContext {
     pub cwd: PathBuf,
+    pub api_key: String,
     pub dangerously_skip_permissions: bool,
     pub allow_all: bool,
     pub prompter: Arc<dyn PermissionPrompter>,
@@ -42,11 +44,13 @@ pub struct ToolContext {
 impl ToolContext {
     pub fn new(
         cwd: PathBuf,
+        api_key: String,
         dangerously_skip_permissions: bool,
         prompter: Arc<dyn PermissionPrompter>,
     ) -> Self {
         Self {
             cwd,
+            api_key,
             dangerously_skip_permissions,
             allow_all: false,
             prompter,
@@ -100,6 +104,7 @@ impl ToolRegistry {
         registry.register(GlobSearchTool);
         registry.register(GrepSearchTool);
         registry.register(ListDirTool);
+        registry.register(CallModelTool);
         registry
     }
 
@@ -448,6 +453,42 @@ impl Tool for ListDirTool {
     }
 }
 
+struct CallModelTool;
+
+#[async_trait]
+impl Tool for CallModelTool {
+    fn name(&self) -> &'static str {
+        "call_model"
+    }
+    fn description(&self) -> &'static str {
+        "调用其他模型完成子任务，例如低成本总结、代码审阅、交叉检查或专门推理"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "model":{"type":"string","description":"要调用的模型名称，不能是主模型 Claude-Opus-4.6 时用于委托其他模型"},
+                "prompt":{"type":"string","description":"发送给目标模型的任务内容"},
+                "system":{"type":"string","description":"可选 system 指令"},
+                "max_tokens":{"type":"integer","description":"最大输出 token，默认 2048"}
+            },
+            "required":["model","prompt"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let model = string_arg(&args, "model")?;
+        let prompt = string_arg(&args, "prompt")?;
+        let system = args.get("system").and_then(Value::as_str);
+        let max_tokens = optional_u64_arg(&args, "max_tokens", 2048).clamp(1, 16_000) as u32;
+        let client = ChatCompletionsClient::new(context.api_key.clone());
+        let response = client
+            .complete_once(&model, system, &prompt, max_tokens)
+            .await
+            .with_context(|| format!("调用模型失败: {model}"))?;
+        Ok(ToolOutput::ok(response))
+    }
+}
+
 pub struct AlwaysAllowPrompter;
 
 #[async_trait]
@@ -463,7 +504,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn context(dir: &Path) -> ToolContext {
-        ToolContext::new(dir.to_path_buf(), true, Arc::new(AlwaysAllowPrompter))
+        ToolContext::new(
+            dir.to_path_buf(),
+            "test-key".to_string(),
+            true,
+            Arc::new(AlwaysAllowPrompter),
+        )
     }
 
     #[tokio::test]

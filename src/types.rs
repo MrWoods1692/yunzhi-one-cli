@@ -148,7 +148,7 @@ impl Default for AgentOptions {
     fn default() -> Self {
         Self {
             dangerously_skip_permissions: false,
-            model: "yunzhi-one".to_string(),
+            model: crate::llm::DEFAULT_MODEL.to_string(),
             max_tokens: 4096,
         }
     }

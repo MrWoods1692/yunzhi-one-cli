@@ -44,10 +44,11 @@ yunzhi
 
 ## MVP 能力
 
-- 兼容 Anthropic Messages API 风格，请求固定发送到 `https://yunzhiapi.cn/v1/messages`。
-- 支持 `stream: true` SSE 流式响应解析。
+- 主模型固定为 `Claude-Opus-4.6`，请求固定发送到 `https://yunzhiapi.cn/v1/chat/completions`。
+- 支持 chat-completions 风格 `stream: true` SSE 流式响应解析。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
-- 支持 `read_file`、`write_file`、`edit_file`、`bash`、`glob_search`、`grep_search`、`list_dir`。
+- 支持 `read_file`、`write_file`、`edit_file`、`bash`、`glob_search`、`grep_search`、`list_dir`、`call_model`。
+- 主模型可以通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
 - 写文件、编辑文件、执行 bash 默认需要确认，支持 `--dangerously-skip-permissions` 跳过。
 - 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt。
 - 对话历史保存在内存中，超过阈值后做简单摘要压缩。

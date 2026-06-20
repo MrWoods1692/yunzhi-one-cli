@@ -24,6 +24,7 @@ impl<C: LlmClient> Agent<C> {
     pub fn new(
         client: C,
         cwd: PathBuf,
+        api_key: String,
         options: AgentOptions,
         prompter: Arc<dyn PermissionPrompter>,
     ) -> Result<Self> {
@@ -37,7 +38,7 @@ impl<C: LlmClient> Agent<C> {
             tools: ToolRegistry::builtin(),
             history: Vec::new(),
             system_prompt,
-            context: ToolContext::new(cwd, options.dangerously_skip_permissions, prompter),
+            context: ToolContext::new(cwd, api_key, options.dangerously_skip_permissions, prompter),
             options,
         })
     }
@@ -154,7 +155,7 @@ impl<C: LlmClient> Agent<C> {
 }
 
 fn base_system_prompt() -> String {
-    "你是云智 One，一个在终端内协助软件开发的智能体。你可以调用工具读取、搜索、编辑文件和执行命令。修改文件或执行命令前会请求用户确认。优先给出简洁、准确、可执行的回答。".to_string()
+    "你是云智 One，一个在终端内协助软件开发的智能体。主模型是 Claude-Opus-4.6。你可以调用工具读取、搜索、编辑文件、执行命令，也可以在需要低成本推理、专门任务或交叉检查时调用 call_model 委托其他模型。修改文件或执行命令前会请求用户确认。优先给出简洁、准确、可执行的回答。".to_string()
 }
 
 fn estimate_tokens(text: &str) -> usize {

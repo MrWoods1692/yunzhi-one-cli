@@ -76,7 +76,7 @@ fn run_config(command: ConfigCommand) -> Result<()> {
 
 async fn build_agent(dangerously_skip_permissions: bool) -> Result<Agent<AnthropicLikeClient>> {
     let config = ensure_config_interactive()?;
-    let client = AnthropicLikeClient::new(config.api_key);
+    let client = AnthropicLikeClient::new(config.api_key.clone());
     let options = AgentOptions {
         dangerously_skip_permissions,
         ..AgentOptions::default()
@@ -84,6 +84,7 @@ async fn build_agent(dangerously_skip_permissions: bool) -> Result<Agent<Anthrop
     Agent::new(
         client,
         std::env::current_dir()?,
+        config.api_key,
         options,
         Arc::new(StdoutPrompter),
     )
