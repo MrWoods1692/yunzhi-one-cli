@@ -1,5 +1,6 @@
 use crate::config::load_project_memory;
 use crate::extensions::render_skills_index;
+use crate::hooks::{format_hook_runs, run_matching_hooks, HookEvent};
 use crate::llm::{ChatRequest, LlmClient, ToolChoice};
 use crate::tools::{PermissionPrompter, PermissionRequest, ToolContext, ToolRegistry};
 use crate::tui;
@@ -201,10 +202,47 @@ impl<C: LlmClient> Agent<C> {
                 let summary = call.input.to_string();
                 let tool_started = Instant::now();
                 tui::print_tool_start(&call.name, &summary);
-                let output = self
-                    .tools
-                    .execute(&call.name, call.input, &mut self.context)
-                    .await;
+                let output = match run_matching_hooks(
+                    &self.context.cwd,
+                    HookEvent::PreTool,
+                    &call.name,
+                    &call.input,
+                    None,
+                )
+                .await
+                {
+                    Ok(_) => {
+                        let mut output = self
+                            .tools
+                            .execute(&call.name, call.input.clone(), &mut self.context)
+                            .await;
+                        match run_matching_hooks(
+                            &self.context.cwd,
+                            HookEvent::PostTool,
+                            &call.name,
+                            &call.input,
+                            Some(&output.content),
+                        )
+                        .await
+                        {
+                            Ok(hooks) if !hooks.is_empty() => {
+                                output.content.push_str("\n\n");
+                                output.content.push_str(&format_hook_runs(&hooks));
+                                output
+                            }
+                            Ok(_) => output,
+                            Err(error) => {
+                                output.is_error = true;
+                                output.content.push_str("\n\npost_tool hook failed:\n");
+                                output.content.push_str(&error.to_string());
+                                output
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        crate::types::ToolOutput::error(format!("pre_tool hook failed:\n{}", error))
+                    }
+                };
                 tui::print_tool_done(!output.is_error, tool_started.elapsed().as_secs_f32());
                 self.history.push(Message::tool_result(
                     call.id,
