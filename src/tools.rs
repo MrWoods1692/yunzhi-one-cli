@@ -97,6 +97,7 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "glob_search"
             | "grep_search"
             | "manage_todos"
+            | "list_models"
             | "call_model"
     )
 }
@@ -156,6 +157,7 @@ impl ToolRegistry {
         registry.register(GlobSearchTool);
         registry.register(GrepSearchTool);
         registry.register(ListDirTool);
+        registry.register(ListModelsTool);
         registry.register(CallModelTool);
         registry.register(ExecuteCodeTool);
         registry.register(RunProgramTool);
@@ -173,6 +175,15 @@ impl ToolRegistry {
             .tools
             .values()
             .map(|tool| tool.definition())
+            .collect::<Vec<_>>();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        definitions
+    }
+
+    pub fn definitions_for(&self, names: &[&str]) -> Vec<ToolDefinition> {
+        let mut definitions = names
+            .iter()
+            .filter_map(|name| self.tools.get(*name).map(|tool| tool.definition()))
             .collect::<Vec<_>>();
         definitions.sort_by(|a, b| a.name.cmp(&b.name));
         definitions
@@ -466,7 +477,11 @@ impl Tool for MovePathTool {
             fs::create_dir_all(parent).await?;
         }
         fs::rename(&source, &destination).await.with_context(|| {
-            format!("移动路径失败: {} -> {}", source.display(), destination.display())
+            format!(
+                "移动路径失败: {} -> {}",
+                source.display(),
+                destination.display()
+            )
         })?;
         Ok(ToolOutput::ok(format!(
             "已移动 {} 到 {}",
@@ -724,6 +739,34 @@ impl Tool for ListDirTool {
     }
 }
 
+struct ListModelsTool;
+
+#[async_trait]
+impl Tool for ListModelsTool {
+    fn name(&self) -> &'static str {
+        "list_models"
+    }
+    fn description(&self) -> &'static str {
+        "读取云智 API 当前可用模型列表，返回已清洗的模型 id，供主模型选择子智能体模型"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"hint":{"type":"string","description":"可选，说明本次模型选择用途"}}})
+    }
+    async fn execute(&self, _args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let client = ChatCompletionsClient::new(context.api_key.clone());
+        let models = client.list_models().await?;
+        let rendered = models
+            .into_iter()
+            .map(|model| match model.owned_by {
+                Some(owner) => format!("{} ({})", model.id, owner),
+                None => model.id,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ToolOutput::ok(rendered))
+    }
+}
+
 struct CallModelTool;
 
 #[async_trait]
@@ -747,7 +790,8 @@ impl Tool for CallModelTool {
         })
     }
     async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
-        let model = string_arg(&args, "model")?;
+        let model = string_arg(&args, "model")?.trim().to_string();
+        anyhow::ensure!(!model.is_empty(), "model 不能为空");
         let prompt = string_arg(&args, "prompt")?;
         let system = args.get("system").and_then(Value::as_str);
         let max_tokens = optional_u64_arg(&args, "max_tokens", 2048).clamp(1, 16_000) as u32;
@@ -1018,14 +1062,23 @@ async fn copy_path(source: &Path, destination: &Path) -> Result<()> {
         .await
         .with_context(|| format!("读取源路径失败: {}", source.display()))?;
     if metadata.is_dir() {
-        copy_dir_recursive(source, destination)
-            .with_context(|| format!("复制目录失败: {} -> {}", source.display(), destination.display()))
+        copy_dir_recursive(source, destination).with_context(|| {
+            format!(
+                "复制目录失败: {} -> {}",
+                source.display(),
+                destination.display()
+            )
+        })
     } else {
         if let Some(parent) = destination.parent() {
             fs::create_dir_all(parent).await?;
         }
         fs::copy(source, destination).await.with_context(|| {
-            format!("复制文件失败: {} -> {}", source.display(), destination.display())
+            format!(
+                "复制文件失败: {} -> {}",
+                source.display(),
+                destination.display()
+            )
         })?;
         Ok(())
     }
@@ -1290,11 +1343,7 @@ mod tests {
             .await;
         assert!(!output.is_error, "{}", output.content);
         let output = registry
-            .execute(
-                "read_file",
-                json!({"path":"copied/b/source.txt"}),
-                &mut ctx,
-            )
+            .execute("read_file", json!({"path":"copied/b/source.txt"}), &mut ctx)
             .await;
         assert_eq!(output.content, "copy me");
         let output = registry

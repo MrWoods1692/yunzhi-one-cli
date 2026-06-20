@@ -51,8 +51,8 @@ yunzhi
 - 支持 `--mode` 选择智能体模式，交互中也可以用 `/mode` 查看和切换。
 - 内置模式：`chat`、`plan-act`、`entanglement`、`agent`、`team`、`analyze`。
 - 预留 `LlmClient` trait，真实接口格式变化时可替换适配层。
-- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`manage_todos`、`system_control`、`call_model`。
-- 主模型可以通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
+- 支持 `read_file`、`write_file`、`edit_file`、`append_file`、`create_dir`、`copy_path`、`move_path`、`delete_path`、`file_info`、`bash`、`execute_code`、`run_program`、`glob_search`、`grep_search`、`list_dir`、`list_models`、`manage_todos`、`system_control`、`call_model`。
+- 主模型可以通过 `list_models` 读取云智 API 可用模型列表，并通过 `call_model` 工具调用其他模型完成子任务或交叉检查。
 - 写文件、编辑文件、追加文件、复制路径、移动路径、删除路径、执行 bash、执行代码、运行程序和终止进程默认需要确认，支持 `--dangerously-skip-permissions` 跳过。
 - `manage_todos` 在当前会话中维护任务列表，支持新增、更新、列出和清空。
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
@@ -63,10 +63,10 @@ yunzhi
 ## 智能体模式
 
 - `chat`：一次发送一个对话回复，问答、解释和轻量建议优先，默认更克制地使用会改变环境的工具。
-- `plan-act`：先规划再执行，适合需要分步实现和验证的任务。
+- `plan-act`：先规划再执行。交互会话中第一轮只开放只读工具用于读取文件、列目录和搜索；用户输入 `act` 后才恢复写入、执行等工具并开始执行。单次 `print --mode plan-act` 只输出计划。
 - `entanglement`：强调上下文联动和交叉检查，适合复杂问题拆解。
 - `agent`：默认自主开发模式，需求清楚时直接强制调用工具读写、运行和验证，由工具层负责 diff 和权限确认。
-- `team`：用架构、实现、测试、审查等角色视角协作推进，并可委派其他模型。
+- `team`：主模型担任调度器，先读取可用模型列表，再按架构、实现、测试、审查等角色把任务分配给不同子智能体；一个子智能体完成后，主模型把交付物作为上下文唤醒下一位子智能体。
 - `analyze`：只读分析、定位风险和比较方案优先，适合评审和排查。
 
 ## 设计取舍

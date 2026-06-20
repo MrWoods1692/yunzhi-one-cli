@@ -10,6 +10,14 @@ use std::sync::Arc;
 use std::time::Instant;
 
 const TOKEN_THRESHOLD: usize = 24_000;
+const PLAN_READ_ONLY_TOOLS: &[&str] = &[
+    "read_file",
+    "list_dir",
+    "glob_search",
+    "grep_search",
+    "file_info",
+    "list_models",
+];
 
 pub struct Agent<C: LlmClient> {
     client: C,
@@ -18,6 +26,7 @@ pub struct Agent<C: LlmClient> {
     system_prompt: String,
     context: ToolContext,
     options: AgentOptions,
+    pending_plan: Option<String>,
 }
 
 impl<C: LlmClient> Agent<C> {
@@ -46,6 +55,7 @@ impl<C: LlmClient> Agent<C> {
                 auto_approve,
             ),
             options,
+            pending_plan: None,
         })
     }
 
@@ -56,6 +66,7 @@ impl<C: LlmClient> Agent<C> {
     pub fn set_mode(&mut self, mode: AgentMode) -> Result<()> {
         self.options.mode = mode;
         self.system_prompt = build_system_prompt(mode)?;
+        self.pending_plan = None;
         Ok(())
     }
 
@@ -66,6 +77,7 @@ impl<C: LlmClient> Agent<C> {
 
     pub fn clear(&mut self) -> Result<()> {
         self.history.clear();
+        self.pending_plan = None;
         self.refresh_system_prompt()?;
         Ok(())
     }
@@ -80,8 +92,18 @@ impl<C: LlmClient> Agent<C> {
     }
 
     pub async fn run_turn(&mut self, input: String) -> Result<String> {
-        let tool_choice = tool_choice_for_input(self.options.mode, &input);
-        self.history.push(Message::user(input));
+        let plan_act_execute = matches!(self.options.mode, AgentMode::PlanAct)
+            && is_act_approval(&input)
+            && self.pending_plan.is_some();
+        let plan_act_planning =
+            matches!(self.options.mode, AgentMode::PlanAct) && !plan_act_execute;
+        let prepared = self.prepare_turn_input(input);
+        let tool_choice = if plan_act_execute {
+            ToolChoice::Required
+        } else {
+            tool_choice_for_input(self.options.mode, &prepared)
+        };
+        self.history.push(Message::user(prepared));
         self.compress_if_needed();
         let started = Instant::now();
         let mut final_text = String::new();
@@ -93,7 +115,11 @@ impl<C: LlmClient> Agent<C> {
                 max_tokens: self.options.max_tokens,
                 system: Some(self.system_prompt.clone()),
                 messages: self.history.clone(),
-                tools: self.tools.definitions(),
+                tools: if plan_act_planning {
+                    self.tools.definitions_for(PLAN_READ_ONLY_TOOLS)
+                } else {
+                    self.tools.definitions()
+                },
                 tool_choice: tool_choice.clone(),
             };
 
@@ -136,6 +162,9 @@ impl<C: LlmClient> Agent<C> {
             }
 
             if tool_calls.is_empty() {
+                if matches!(self.options.mode, AgentMode::PlanAct) && self.pending_plan.is_none() {
+                    self.pending_plan = Some(final_text.trim().to_string());
+                }
                 if tool_call_count == 0 && looks_like_unverified_completion(&final_text) {
                     tui::print_unverified_completion_warning();
                 }
@@ -161,6 +190,32 @@ impl<C: LlmClient> Agent<C> {
             }
             self.compress_if_needed();
         }
+    }
+
+    fn prepare_turn_input(&mut self, input: String) -> String {
+        if matches!(self.options.mode, AgentMode::PlanAct) {
+            if is_act_approval(&input) {
+                if let Some(plan) = self.pending_plan.take() {
+                    return format!(
+                        "用户已输入 act，批准执行上一份计划。请严格按计划执行，必要时读取、编辑、运行和验证。上一份计划如下:\n\n{}",
+                        plan
+                    );
+                }
+            } else {
+                self.pending_plan = None;
+                return format!(
+                    "请先制定计划。你可以调用只读工具了解项目现状，包括读取文件、列目录、搜索、查看文件信息和读取模型列表；严禁写入/编辑/删除文件，严禁执行命令或运行程序。计划必须基于必要的只读探查，包含目标、步骤、风险和验证方式。计划结尾必须提示用户输入 act 后才开始执行。用户请求:\n{}",
+                    input
+                );
+            }
+        }
+        if matches!(self.options.mode, AgentMode::Team) {
+            return format!(
+                "Team 模式任务。第一步必须调用 list_models 获取可用模型列表；然后根据模型名称特征和任务需求，使用 call_model 分配架构、实现、测试、审查等子智能体任务。当前阶段完成后，必须在总结中声明下一位被唤醒的智能体、输入上下文和交付物，形成一个人一个公司的协作流。用户请求:\n{}",
+                input
+            );
+        }
+        input
     }
 
     fn compress_if_needed(&mut self) {
@@ -235,6 +290,12 @@ fn tool_choice_for_input(mode: AgentMode, input: &str) -> ToolChoice {
     if matches!(mode, AgentMode::Chat | AgentMode::Analyze) {
         return ToolChoice::Auto;
     }
+    if matches!(mode, AgentMode::PlanAct) && !is_act_approval(input) {
+        return ToolChoice::Auto;
+    }
+    if matches!(mode, AgentMode::Team) {
+        return ToolChoice::Function("list_models".to_string());
+    }
     if mentions_file_write(input) {
         return ToolChoice::Function("write_file".to_string());
     }
@@ -289,13 +350,20 @@ fn mentions_command_run(input: &str) -> bool {
     .any(|word| input.contains(word) || lower.contains(word))
 }
 
+fn is_act_approval(input: &str) -> bool {
+    matches!(
+        input.trim().to_ascii_lowercase().as_str(),
+        "act" | "执行" | "开始执行"
+    )
+}
+
 fn mode_prompt(mode: AgentMode) -> &'static str {
     match mode {
         AgentMode::Chat => "chat 模式：以解释、问答和轻量建议为主。除非用户明确要求修改或运行，否则优先不调用会改变环境的工具。",
-        AgentMode::PlanAct => "plan&act 模式：先给出短计划，确认目标和风险后分步执行；执行过程中持续更新计划并验证结果。",
+        AgentMode::PlanAct => "plan&act 模式：第一轮只能制定计划，可以使用只读工具读取文件、列目录、搜索和查看信息；严禁写入、编辑、删除、执行命令或运行程序。计划末尾提示用户输入 act。只有用户明确输入 act 后，才进入执行阶段，并按计划编辑、运行和验证。",
         AgentMode::Entanglement => "entanglement 模式：把用户、代码、工具和其他模型视为协同上下文；主动交叉检查关键判断，在复杂任务中用 call_model 分离子问题。",
         AgentMode::Agent => "agent 模式：默认自主完成软件开发任务；在需求清楚时必须直接调用工具读取、编辑、测试和总结，不要用对话确认替代工具操作，遇到高风险操作由工具权限确认接管。",
-        AgentMode::Team => "team 模式：模拟小团队协作，把任务拆成架构、实现、测试、审查等角色视角；必要时委派其他模型处理子任务并汇总决策。",
+        AgentMode::Team => "team 模式：主模型担任 CEO/调度器。每个新任务第一步必须调用 list_models 获取可用模型列表，然后按需求用 call_model 分配子智能体任务。子智能体可处于 waiting/running/done 状态；某智能体完成后，主模型根据交付物唤醒下一位智能体，并把必要上下文传给它，形成一个人一个公司的流水线。",
         AgentMode::Analyze => "analyze 模式：以只读分析、定位问题、风险评估和方案比较为主；除非用户明确授权，避免修改文件或执行破坏性操作。",
     }
 }
@@ -344,5 +412,29 @@ mod tests {
             tool_choice_for_input(AgentMode::Chat, "新建一个txt文件，里面写上test"),
             ToolChoice::Auto
         );
+    }
+
+    #[test]
+    fn team_mode_starts_with_model_discovery() {
+        assert_eq!(
+            tool_choice_for_input(AgentMode::Team, "实现一个功能"),
+            ToolChoice::Function("list_models".to_string())
+        );
+    }
+
+    #[test]
+    fn recognizes_act_approval() {
+        assert!(is_act_approval("act"));
+        assert!(is_act_approval("执行"));
+        assert!(!is_act_approval("先写计划"));
+    }
+
+    #[test]
+    fn plan_read_only_tools_exclude_mutating_tools() {
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"read_file"));
+        assert!(PLAN_READ_ONLY_TOOLS.contains(&"grep_search"));
+        assert!(!PLAN_READ_ONLY_TOOLS.contains(&"write_file"));
+        assert!(!PLAN_READ_ONLY_TOOLS.contains(&"bash"));
+        assert!(!PLAN_READ_ONLY_TOOLS.contains(&"run_program"));
     }
 }

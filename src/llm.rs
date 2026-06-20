@@ -78,6 +78,39 @@ impl ChatCompletionsClient {
             .unwrap_or_default()
             .to_string())
     }
+
+    pub async fn list_models(&self) -> Result<Vec<ModelInfo>> {
+        let response = self
+            .http
+            .get(format!("{}/models", self.base_url))
+            .header("x-api-key", &self.api_key)
+            .bearer_auth(&self.api_key)
+            .send()
+            .await
+            .context("请求云智模型列表失败")?;
+        Ok(Self::ensure_success(response)
+            .await?
+            .json()
+            .await
+            .map(parse_models)?)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelInfo {
+    pub id: String,
+    pub owned_by: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelRecord>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelRecord {
+    id: String,
+    owned_by: Option<String>,
 }
 
 pub type AnthropicLikeClient = ChatCompletionsClient;
@@ -193,12 +226,12 @@ impl LlmClient for ChatCompletionsClient {
                     if raw_event.trim().is_empty() {
                         continue;
                     }
-                    
+
                     // 调试日志：打印原始 SSE 事件
                     if std::env::var("YUNZHI_DEBUG").is_ok() {
                         eprintln!("[DEBUG SSE] {}", raw_event);
                     }
-                    
+
                     match parse_sse_event(&raw_event, &mut pending_tools) {
                         Ok(events) => {
                             for event in events {
@@ -252,7 +285,7 @@ impl ChatCompletionsClient {
             tools: request.tools.iter().map(to_chat_tool).collect(),
             tool_choice: (!request.tools.is_empty()).then(|| request.tool_choice.to_value()),
         };
-        
+
         // 调试日志：打印请求体
         if std::env::var("YUNZHI_DEBUG").is_ok() {
             eprintln!("[DEBUG REQUEST] tools count: {}", request.tools.len());
@@ -261,11 +294,17 @@ impl ChatCompletionsClient {
                 eprintln!("[DEBUG REQUEST] tool_choice JSON: {}", tc);
             }
             if !body.tools.is_empty() {
-                eprintln!("[DEBUG REQUEST] first tool: {}", serde_json::to_string_pretty(&body.tools[0]).unwrap_or_default());
+                eprintln!(
+                    "[DEBUG REQUEST] first tool: {}",
+                    serde_json::to_string_pretty(&body.tools[0]).unwrap_or_default()
+                );
             }
-            eprintln!("[DEBUG REQUEST] full body: {}", serde_json::to_string_pretty(&body).unwrap_or_default());
+            eprintln!(
+                "[DEBUG REQUEST] full body: {}",
+                serde_json::to_string_pretty(&body).unwrap_or_default()
+            );
         }
-        
+
         self.send_json(body).await
     }
 
@@ -280,6 +319,10 @@ impl ChatCompletionsClient {
             .await
             .context("请求云智 API 失败")?;
 
+        Self::ensure_success(response).await
+    }
+
+    async fn ensure_success(response: reqwest::Response) -> Result<reqwest::Response> {
         if response.status() == StatusCode::UNAUTHORIZED
             || response.status() == StatusCode::FORBIDDEN
         {
@@ -290,9 +333,25 @@ impl ChatCompletionsClient {
             let text = response.text().await.unwrap_or_default();
             anyhow::bail!("云智 API 返回错误 {}: {}", status, text);
         }
-
         Ok(response)
     }
+}
+
+fn parse_models(response: ModelsResponse) -> Vec<ModelInfo> {
+    let mut models = response
+        .data
+        .into_iter()
+        .filter_map(|model| {
+            let id = model.id.trim().to_string();
+            (!id.is_empty()).then_some(ModelInfo {
+                id,
+                owned_by: model.owned_by,
+            })
+        })
+        .collect::<Vec<_>>();
+    models.sort_by(|a, b| a.id.cmp(&b.id));
+    models.dedup_by(|a, b| a.id == b.id);
+    models
 }
 
 fn to_chat_tool(definition: &ToolDefinition) -> ChatTool {
@@ -417,12 +476,15 @@ fn parse_sse_event(
 
     let value: Value =
         serde_json::from_str(&data).with_context(|| format!("解析 SSE 数据失败: {data}"))?;
-    
+
     // 调试日志：打印解析后的 JSON
     if std::env::var("YUNZHI_DEBUG").is_ok() {
-        eprintln!("[DEBUG JSON] {}", serde_json::to_string_pretty(&value).unwrap_or_default());
+        eprintln!(
+            "[DEBUG JSON] {}",
+            serde_json::to_string_pretty(&value).unwrap_or_default()
+        );
     }
-    
+
     if let Some(error) = value.get("error") {
         anyhow::bail!("云智 API 流式错误: {}", error);
     }
@@ -455,14 +517,14 @@ fn parse_sse_event(
             }
         }
     }
-    
+
     // 检查是否有 finish_reason
     if let Some(finish_reason) = choice.get("finish_reason").and_then(Value::as_str) {
         // 无论什么 finish_reason，都先完成待处理的工具调用
         if !pending_tools.is_empty() {
             events.extend(finish_pending_tools(pending_tools));
         }
-        
+
         // 然后根据 finish_reason 添加相应事件
         match finish_reason {
             "tool_calls" => {
@@ -477,7 +539,7 @@ fn parse_sse_event(
             }
         }
     }
-    
+
     Ok(events)
 }
 
@@ -564,5 +626,29 @@ mod tests {
         let value = ToolChoice::Function("write_file".to_string()).to_value();
         assert_eq!(value["type"], "function");
         assert_eq!(value["function"]["name"], "write_file");
+    }
+
+    #[test]
+    fn parses_and_cleans_model_list() {
+        let response = ModelsResponse {
+            data: vec![
+                ModelRecord {
+                    id: " MiniMax-M3\r\n".to_string(),
+                    owned_by: Some("yunzhi-api".to_string()),
+                },
+                ModelRecord {
+                    id: "".to_string(),
+                    owned_by: None,
+                },
+                ModelRecord {
+                    id: "Gemini-3.5-Flash".to_string(),
+                    owned_by: Some("yunzhi-api".to_string()),
+                },
+            ],
+        };
+        let models = parse_models(response);
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0].id, "Gemini-3.5-Flash");
+        assert_eq!(models[1].id, "MiniMax-M3");
     }
 }
