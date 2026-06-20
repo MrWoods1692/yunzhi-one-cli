@@ -283,7 +283,10 @@ impl ChatCompletionsClient {
             stream: true,
             messages: to_chat_messages(request.system.as_deref(), &request.messages),
             tools: request.tools.iter().map(to_chat_tool).collect(),
-            tool_choice: (!request.tools.is_empty()).then(|| request.tool_choice.to_value()),
+            tool_choice: match (&request.tool_choice, request.tools.is_empty()) {
+                (_, true) | (ToolChoice::Auto, false) => None,
+                (tool_choice, false) => Some(tool_choice.to_value()),
+            },
         };
 
         // 调试日志：打印请求体
@@ -601,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn serializes_tool_choice_auto_when_tools_exist() {
+    fn omits_auto_tool_choice_when_tools_exist() {
         let body = ChatCompletionsRequest {
             model: DEFAULT_MODEL,
             max_tokens: 4096,
@@ -615,10 +618,10 @@ mod tests {
                     parameters: json!({"type":"object"}),
                 },
             }],
-            tool_choice: Some(ToolChoice::Auto.to_value()),
+            tool_choice: None,
         };
         let value = serde_json::to_value(body).unwrap();
-        assert_eq!(value["tool_choice"], "auto");
+        assert!(value.get("tool_choice").is_none());
     }
 
     #[test]

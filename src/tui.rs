@@ -33,6 +33,7 @@ use tokio::time::{self, Duration};
 use unicode_width::UnicodeWidthChar;
 
 static EVENT_SENDER: OnceLock<Mutex<Option<mpsc::UnboundedSender<TuiEvent>>>> = OnceLock::new();
+const CONTINUATION_PREFIX: &str = "↵ ";
 
 pub enum TuiEvent {
     User(String),
@@ -624,10 +625,11 @@ impl FullscreenApp {
     }
 
     fn render_output(&mut self, frame: &mut ratatui::Frame, area: Rect) {
+        let content_width = area.width.saturating_sub(2) as usize;
         let output_items = self
             .lines
             .iter()
-            .flat_map(LogLine::to_items)
+            .flat_map(|line| line.to_items(content_width))
             .collect::<Vec<_>>();
         let visible_height = area.height.saturating_sub(2) as usize;
         let max_scroll = output_items.len().saturating_sub(visible_height);
@@ -670,6 +672,7 @@ impl FullscreenApp {
             .split(area);
         for (index, column_area) in columns.iter().enumerate() {
             let column = &self.team_columns[index];
+            let content_width = column_area.width.saturating_sub(2) as usize;
             let status = match column.status {
                 TeamStatus::Waiting => "waiting",
                 TeamStatus::Running => "running",
@@ -677,13 +680,16 @@ impl FullscreenApp {
                 TeamStatus::Failed => "failed",
             };
             let title = format!(" {} | {} ", column.title, status);
-            let items = column
+            let wrapped_items = column
                 .messages
                 .iter()
+                .flat_map(|message| wrap_team_message(message, content_width))
+                .collect::<Vec<_>>();
+            let items = wrapped_items
+                .into_iter()
                 .rev()
                 .take(column_area.height.saturating_sub(2) as usize)
                 .rev()
-                .map(|message| ListItem::new(Line::from(message.clone())))
                 .collect::<Vec<_>>();
             let border = if Some(index) == self.active_team_column {
                 Color::Cyan
@@ -811,11 +817,18 @@ impl FullscreenApp {
                 );
                 self.push(LogLine::dim("状态已更新"));
             }
-            TuiEvent::Warning(message) => self.push(LogLine::warn(message)),
-            TuiEvent::Info(message) => self.push(LogLine::info(message)),
+            TuiEvent::Warning(message) => {
+                self.push(LogLine::warn(message.clone()));
+                self.push_team_line(0, format!("! {message}"));
+            }
+            TuiEvent::Info(message) => {
+                self.push(LogLine::info(message.clone()));
+                self.push_team_line(0, format!("i {message}"));
+            }
             TuiEvent::Error(message) => {
                 self.busy = false;
-                self.push(LogLine::error(message));
+                self.push(LogLine::error(message.clone()));
+                self.push_team_line(0, format!("x {message}"));
             }
             TuiEvent::ModeChanged(mode) => {
                 self.mode = mode;
@@ -1029,6 +1042,24 @@ impl FullscreenApp {
             } else {
                 column.messages.push(text.to_string());
             }
+            if column.messages.len() > 200 {
+                column.messages.drain(..50);
+            }
+        }
+    }
+
+    fn push_team_line(&mut self, index: usize, text: impl Into<String>) {
+        if self.mode != AgentMode::Team {
+            return;
+        }
+        while self.team_columns.len() <= index {
+            self.team_columns.push(TeamColumn::new(format!(
+                "子智能体 {}",
+                self.team_columns.len()
+            )));
+        }
+        if let Some(column) = self.team_columns.get_mut(index) {
+            column.messages.push(text.into());
             if column.messages.len() > 200 {
                 column.messages.drain(..50);
             }
@@ -1384,7 +1415,7 @@ impl LogLine {
         }
     }
 
-    fn to_items(&self) -> Vec<ListItem<'static>> {
+    fn to_items(&self, content_width: usize) -> Vec<ListItem<'static>> {
         let (label, style) = match self.kind {
             LogKind::User => (
                 "> ",
@@ -1399,6 +1430,11 @@ impl LogLine {
             LogKind::Error => ("x ", Style::default().fg(Color::Red)),
             LogKind::Dim => ("  ", Style::default().fg(Color::DarkGray)),
         };
+        let label_width = display_width(label);
+        let continuation_width = display_width(CONTINUATION_PREFIX);
+        let first_width = content_width.saturating_sub(label_width).max(1);
+        let continuation_text_width = content_width.saturating_sub(continuation_width).max(1);
+
         self.text
             .lines()
             .chain(if self.text.ends_with('\n') {
@@ -1406,14 +1442,93 @@ impl LogLine {
             } else {
                 None
             })
-            .map(|line| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(label, style),
-                    Span::raw(line.to_string()),
-                ]))
+            .flat_map(|line| {
+                wrap_display_line(line, first_width, continuation_text_width)
+                    .into_iter()
+                    .enumerate()
+                    .map(move |(index, part)| {
+                        if index == 0 {
+                            ListItem::new(Line::from(vec![
+                                Span::styled(label, style),
+                                Span::raw(part),
+                            ]))
+                        } else {
+                            ListItem::new(Line::from(vec![
+                                Span::styled(
+                                    CONTINUATION_PREFIX,
+                                    Style::default().fg(Color::DarkGray),
+                                ),
+                                Span::raw(part),
+                            ]))
+                        }
+                    })
             })
             .collect()
     }
+}
+
+fn wrap_team_message(message: &str, content_width: usize) -> Vec<ListItem<'static>> {
+    let continuation_width = display_width(CONTINUATION_PREFIX);
+    let first_width = content_width.max(1);
+    let continuation_text_width = content_width.saturating_sub(continuation_width).max(1);
+    message
+        .lines()
+        .chain(if message.ends_with('\n') {
+            Some("")
+        } else {
+            None
+        })
+        .flat_map(|line| {
+            wrap_display_line(line, first_width, continuation_text_width)
+                .into_iter()
+                .enumerate()
+                .map(move |(index, part)| {
+                    if index == 0 {
+                        ListItem::new(Line::from(part))
+                    } else {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(CONTINUATION_PREFIX, Style::default().fg(Color::DarkGray)),
+                            Span::raw(part),
+                        ]))
+                    }
+                })
+        })
+        .collect()
+}
+
+fn wrap_display_line(line: &str, first_width: usize, continuation_width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let first_width = first_width.max(1);
+    let continuation_width = continuation_width.max(1);
+    let mut wrapped = Vec::new();
+    let mut current = String::new();
+    let mut current_width = 0usize;
+
+    for ch in line.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        let max_width = if wrapped.is_empty() {
+            first_width
+        } else {
+            continuation_width
+        };
+        if !current.is_empty() && current_width + char_width > max_width {
+            wrapped.push(std::mem::take(&mut current));
+            current_width = 0;
+        }
+        current.push(ch);
+        current_width += char_width;
+    }
+
+    wrapped.push(current);
+    wrapped
+}
+
+fn display_width(text: &str) -> usize {
+    text.chars()
+        .map(|ch| UnicodeWidthChar::width(ch).unwrap_or(0))
+        .sum()
 }
 
 enum PendingPrompt {
@@ -1791,6 +1906,21 @@ mod tests {
         app.insert_text_at_cursor("abcd中");
 
         assert_eq!(app.cursor_position(Rect::new(0, 0, 7, 5)), (3, 2));
+    }
+
+    #[test]
+    fn wraps_display_line_with_wide_characters() {
+        assert_eq!(
+            wrap_display_line("abc中文def", 5, 4),
+            vec!["abc中".to_string(), "文de".to_string(), "f".to_string()]
+        );
+    }
+
+    #[test]
+    fn log_line_wraps_to_multiple_items() {
+        let items = LogLine::info("abcdefghij").to_items(6);
+
+        assert_eq!(items.len(), 3);
     }
 
     #[test]
