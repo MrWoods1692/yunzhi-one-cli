@@ -11,6 +11,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 use crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyModifiers,
+    MouseEventKind,
 };
 use crossterm::execute;
 use crossterm::style::Stylize;
@@ -363,12 +364,16 @@ pub async fn run_fullscreen(
         tokio::select! {
             _ = tick.tick() => {
                 while event::poll(Duration::from_millis(0))? {
-                    if let Event::Key(key) = event::read()? {
-                        if handle_key(key, &mut app, &command_tx)? {
-                            let _ = command_tx.send(AgentCommand::Shutdown);
-                            clear_event_sender();
-                            return Ok(());
+                    match event::read()? {
+                        Event::Key(key) => {
+                            if handle_key(key, &mut app, &command_tx)? {
+                                let _ = command_tx.send(AgentCommand::Shutdown);
+                                clear_event_sender();
+                                return Ok(());
+                            }
                         }
+                        Event::Mouse(mouse) => handle_mouse(mouse.kind, &mut app),
+                        _ => {}
                     }
                 }
             }
@@ -493,7 +498,7 @@ struct FullscreenApp {
     lines: Vec<LogLine>,
     input: Vec<char>,
     cursor: usize,
-    scroll: u16,
+    scroll: usize,
     history: Vec<String>,
     history_index: Option<usize>,
     status: String,
@@ -530,15 +535,34 @@ impl FullscreenApp {
             ])
             .split(area);
 
+        let output_items = self
+            .lines
+            .iter()
+            .flat_map(LogLine::to_items)
+            .collect::<Vec<_>>();
+        let visible_height = chunks[0].height.saturating_sub(2) as usize;
+        let max_scroll = output_items.len().saturating_sub(visible_height);
+        self.scroll = self.scroll.min(max_scroll);
+        let visible_end = output_items.len().saturating_sub(self.scroll);
+        let visible_start = visible_end.saturating_sub(visible_height);
+        let position = if self.scroll == 0 {
+            "底部".to_string()
+        } else {
+            format!("上移 {} 行", self.scroll)
+        };
         let output = List::new(
-            self.lines
-                .iter()
-                .flat_map(LogLine::to_items)
+            output_items
+                .into_iter()
+                .skip(visible_start)
+                .take(visible_end.saturating_sub(visible_start))
                 .collect::<Vec<_>>(),
         )
         .block(
             Block::default()
-                .title(format!(" 云智 One v{} | 输出 ", self.version))
+                .title(format!(
+                    " 云智 One v{} | 输出 | {} ",
+                    self.version, position
+                ))
                 .borders(Borders::ALL),
         )
         .style(Style::default().fg(Color::Gray));
@@ -758,13 +782,18 @@ impl FullscreenApp {
     }
 
     fn push(&mut self, line: LogLine) {
+        let follow_tail = self.scroll == 0;
         self.lines.push(line);
         if self.lines.len() > 2000 {
             self.lines.drain(..500);
         }
+        if follow_tail {
+            self.scroll = 0;
+        }
     }
 
     fn push_agent_delta(&mut self, delta: &str) {
+        let follow_tail = self.scroll == 0;
         if !matches!(
             self.lines.last(),
             Some(LogLine {
@@ -777,6 +806,25 @@ impl FullscreenApp {
         if let Some(line) = self.lines.last_mut() {
             line.text.push_str(delta);
         }
+        if follow_tail {
+            self.scroll = 0;
+        }
+    }
+
+    fn scroll_up(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_add(lines as usize);
+    }
+
+    fn scroll_down(&mut self, lines: u16) {
+        self.scroll = self.scroll.saturating_sub(lines as usize);
+    }
+
+    fn scroll_to_top(&mut self) {
+        self.scroll = usize::MAX;
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        self.scroll = 0;
     }
 
     fn input_string(&self) -> String {
@@ -835,6 +883,8 @@ fn handle_key(
             app.input.insert(app.cursor, '\n');
             app.cursor += 1;
         }
+        KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(5),
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(5),
         KeyCode::Char(ch) => {
             app.input.insert(app.cursor, ch);
             app.cursor += 1;
@@ -875,12 +925,22 @@ fn handle_key(
                 app.cursor = app.input.len();
             }
         }
-        KeyCode::PageUp => app.scroll = app.scroll.saturating_add(5),
-        KeyCode::PageDown => app.scroll = app.scroll.saturating_sub(5),
+        KeyCode::PageUp => app.scroll_up(10),
+        KeyCode::PageDown => app.scroll_down(10),
+        KeyCode::Home if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_to_top(),
+        KeyCode::End if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_to_bottom(),
         KeyCode::Tab => apply_completion(app),
         _ => {}
     }
     Ok(false)
+}
+
+fn handle_mouse(kind: MouseEventKind, app: &mut FullscreenApp) {
+    match kind {
+        MouseEventKind::ScrollUp => app.scroll_up(3),
+        MouseEventKind::ScrollDown => app.scroll_down(3),
+        _ => {}
+    }
 }
 
 #[derive(Clone)]
@@ -1105,7 +1165,8 @@ fn help_text() -> String {
         "/model <模型名> 切换本会话主控模型",
         "/session help 查看会话命令",
         "/exit 退出",
-        "Enter 发送，Ctrl+J 换行，↑↓ 翻历史，Tab 应用补全，PageUp/PageDown 预留滚动。",
+        "Enter 发送，Ctrl+J 换行，↑↓ 翻历史，Tab 应用补全。",
+        "PageUp/PageDown 或鼠标滚轮滚动输出，Ctrl+Home 顶部，Ctrl+End 底部。",
     ]
     .join("\n")
 }
@@ -1249,4 +1310,17 @@ pub fn parse_hunk_selection(input: &str) -> Result<Vec<usize>> {
     selected.sort_unstable();
     selected.dedup();
     Ok(selected)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn help_mentions_output_scroll_controls() {
+        let text = help_text();
+        assert!(text.contains("PageUp/PageDown"));
+        assert!(text.contains("Ctrl+Home"));
+        assert!(text.contains("Ctrl+End"));
+    }
 }
