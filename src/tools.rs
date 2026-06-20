@@ -129,6 +129,12 @@ fn is_safe_operation(tool_name: &str) -> bool {
             | "read_skill"
             | "list_mcp_servers"
             | "call_model"
+            | "create_presentation"
+            | "generate_image"
+            | "write_document"
+            | "write_table"
+            | "ui_design"
+            | "long_memory"
     )
 }
 
@@ -199,6 +205,19 @@ impl ToolRegistry {
         registry.register(RunProgramTool);
         registry.register(ManageTodosTool);
         registry.register(SystemControlTool);
+        registry.register(CreatePresentationTool);
+        registry.register(GenerateImageTool);
+        registry.register(WriteDocumentTool);
+        registry.register(WriteTableTool);
+        registry.register(DiskManagerTool);
+        registry.register(ComputerManagerTool);
+        registry.register(WebSearchTool);
+        registry.register(BrowserTool);
+        registry.register(NetworkLogsTool);
+        registry.register(ComputerInfoTool);
+        registry.register(DatabaseManagerTool);
+        registry.register(UiDesignTool);
+        registry.register(LongMemoryTool);
         registry
     }
 
@@ -247,6 +266,31 @@ fn optional_u64_arg(args: &Value, key: &str, default: u64) -> u64 {
     args.get(key).and_then(Value::as_u64).unwrap_or(default)
 }
 
+fn optional_string_arg(args: &Value, key: &str) -> Option<String> {
+    args.get(key)
+        .and_then(Value::as_str)
+        .map(|value| value.to_string())
+}
+
+fn bool_arg(args: &Value, key: &str, default: bool) -> bool {
+    args.get(key).and_then(Value::as_bool).unwrap_or(default)
+}
+
+fn array_of_strings_arg(args: &Value, key: &str) -> Result<Vec<String>> {
+    let Some(values) = args.get(key).and_then(Value::as_array) else {
+        return Ok(Vec::new());
+    };
+    values
+        .iter()
+        .map(|value| {
+            value
+                .as_str()
+                .map(ToString::to_string)
+                .ok_or_else(|| anyhow!("{key} 必须全部是字符串"))
+        })
+        .collect()
+}
+
 fn resolve_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
     let path = Path::new(raw);
     let joined = if path.is_absolute() {
@@ -290,6 +334,30 @@ fn diff_text(old: &str, new: &str) -> String {
         rendered.push_str(change.value());
     }
     rendered
+}
+
+async fn write_text_file_with_confirmation(
+    tool_name: &str,
+    path: &Path,
+    content: String,
+    context: &mut ToolContext,
+    summary: String,
+) -> Result<ToolOutput> {
+    let old = tokio::fs::read_to_string(path).await.unwrap_or_default();
+    context
+        .confirm(PermissionRequest {
+            tool_name: tool_name.to_string(),
+            summary,
+            diff: Some(diff_text(&old, &content)),
+        })
+        .await?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::write(path, content)
+        .await
+        .with_context(|| format!("写入文件失败: {}", path.display()))?;
+    Ok(ToolOutput::ok(format!("已写入 {}", path.display())))
 }
 
 struct ReadFileTool;
@@ -1329,6 +1397,905 @@ impl Tool for SystemControlTool {
     }
 }
 
+struct CreatePresentationTool;
+
+#[async_trait]
+impl Tool for CreatePresentationTool {
+    fn name(&self) -> &'static str {
+        "create_presentation"
+    }
+    fn description(&self) -> &'static str {
+        "生成 PPT 大纲或可被 Marp/Markdown 转换为 PPT 的演示文稿文件"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "path":{"type":"string","description":"输出文件路径，建议 .md"},
+                "title":{"type":"string","description":"演示文稿标题"},
+                "audience":{"type":"string","description":"目标受众"},
+                "slides":{"type":"array","items":{"type":"object"},"description":"幻灯片数组，每项可含 title、bullets、speaker_notes、image_prompt"},
+                "theme":{"type":"string","description":"可选，视觉主题"}
+            },
+            "required":["path","title","slides"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let title = string_arg(&args, "title")?;
+        let audience =
+            optional_string_arg(&args, "audience").unwrap_or_else(|| "通用受众".to_string());
+        let theme = optional_string_arg(&args, "theme").unwrap_or_else(|| "default".to_string());
+        let slides = args
+            .get("slides")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("slides 必须是数组"))?;
+        anyhow::ensure!(!slides.is_empty(), "slides 不能为空");
+
+        let mut content = format!(
+            "---\nmarp: true\ntheme: {}\npaginate: true\n---\n\n# {}\n\n目标受众：{}\n",
+            theme, title, audience
+        );
+        for slide in slides {
+            content.push_str("\n---\n\n");
+            let slide_title = slide
+                .get("title")
+                .and_then(Value::as_str)
+                .unwrap_or("未命名页面");
+            content.push_str(&format!("## {}\n", slide_title));
+            if let Some(items) = slide.get("bullets").and_then(Value::as_array) {
+                for item in items.iter().filter_map(Value::as_str) {
+                    content.push_str(&format!("- {}\n", item));
+                }
+            }
+            if let Some(prompt) = slide.get("image_prompt").and_then(Value::as_str) {
+                content.push_str(&format!("\n> 配图提示词：{}\n", prompt));
+            }
+            if let Some(notes) = slide.get("speaker_notes").and_then(Value::as_str) {
+                content.push_str(&format!("\n<!-- 演讲备注：{} -->\n", notes));
+            }
+        }
+        write_text_file_with_confirmation(
+            self.name(),
+            &path,
+            content,
+            context,
+            format!("生成演示文稿 {}", path.display()),
+        )
+        .await
+    }
+}
+
+struct GenerateImageTool;
+
+#[async_trait]
+impl Tool for GenerateImageTool {
+    fn name(&self) -> &'static str {
+        "generate_image"
+    }
+    fn description(&self) -> &'static str {
+        "调用绘图模型生成图片提示、SVG 草图或保存模型返回的图片结果"
+    }
+    fn schema(&self) -> Value {
+        json!({
+            "type":"object",
+            "properties":{
+                "prompt":{"type":"string","description":"绘图提示词"},
+                "model":{"type":"string","description":"绘图或多模态模型名称，默认 Image-Generation"},
+                "path":{"type":"string","description":"可选，保存输出文本/SVG/URL 的文件路径"},
+                "style":{"type":"string","description":"可选，风格约束"},
+                "size":{"type":"string","description":"可选，如 1024x1024"},
+                "save_response":{"type":"boolean","description":"是否保存模型返回内容，默认 true"}
+            },
+            "required":["prompt"]
+        })
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let prompt = string_arg(&args, "prompt")?;
+        let model =
+            optional_string_arg(&args, "model").unwrap_or_else(|| "Image-Generation".to_string());
+        let style = optional_string_arg(&args, "style")
+            .unwrap_or_else(|| "clean, high quality".to_string());
+        let size = optional_string_arg(&args, "size").unwrap_or_else(|| "1024x1024".to_string());
+        let request = format!(
+            "请作为绘图模型生成图片。提示词：{}\n风格：{}\n尺寸：{}\n如果无法直接返回二进制图片，请返回可下载 URL、base64、SVG 或详细的最终绘图提示。",
+            prompt, style, size
+        );
+        let client = ChatCompletionsClient::new(context.api_key.clone());
+        let response = client
+            .complete_once(
+                &model,
+                Some("你是图像生成与视觉提示词模型。"),
+                &request,
+                4096,
+            )
+            .await
+            .with_context(|| format!("调用绘图模型失败: {model}"))?;
+        if bool_arg(&args, "save_response", true) {
+            if let Some(raw_path) = args.get("path").and_then(Value::as_str) {
+                let path = resolve_path(&context.cwd, raw_path)?;
+                return write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    response,
+                    context,
+                    format!("保存图片生成结果 {}", path.display()),
+                )
+                .await;
+            }
+        }
+        Ok(ToolOutput::ok(response))
+    }
+}
+
+struct WriteDocumentTool;
+
+#[async_trait]
+impl Tool for WriteDocumentTool {
+    fn name(&self) -> &'static str {
+        "write_document"
+    }
+    fn description(&self) -> &'static str {
+        "按主题、结构和内容写 Markdown/文本/HTML 文档"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"title":{"type":"string"},"sections":{"type":"array","items":{"type":"object"}},"format":{"type":"string","enum":["markdown","text","html"]}},"required":["path","title","sections"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let title = string_arg(&args, "title")?;
+        let format = optional_string_arg(&args, "format").unwrap_or_else(|| "markdown".to_string());
+        let sections = args
+            .get("sections")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("sections 必须是数组"))?;
+        let mut content = match format.as_str() {
+            "html" => format!("<!doctype html>\n<html><head><meta charset=\"utf-8\"><title>{}</title></head><body>\n<h1>{}</h1>\n", title, title),
+            "text" => format!("{}\n{}\n\n", title, "=".repeat(title.chars().count())),
+            _ => format!("# {}\n\n", title),
+        };
+        for section in sections {
+            let heading = section
+                .get("heading")
+                .and_then(Value::as_str)
+                .unwrap_or("小节");
+            let body = section
+                .get("body")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            match format.as_str() {
+                "html" => content.push_str(&format!("<h2>{}</h2>\n<p>{}</p>\n", heading, body)),
+                "text" => content.push_str(&format!(
+                    "{}\n{}\n\n{}\n\n",
+                    heading,
+                    "-".repeat(heading.chars().count()),
+                    body
+                )),
+                _ => content.push_str(&format!("## {}\n\n{}\n\n", heading, body)),
+            }
+        }
+        if format == "html" {
+            content.push_str("</body></html>\n");
+        }
+        write_text_file_with_confirmation(
+            self.name(),
+            &path,
+            content,
+            context,
+            format!("写文档 {}", path.display()),
+        )
+        .await
+    }
+}
+
+struct WriteTableTool;
+
+#[async_trait]
+impl Tool for WriteTableTool {
+    fn name(&self) -> &'static str {
+        "write_table"
+    }
+    fn description(&self) -> &'static str {
+        "生成 Markdown 或 CSV 表格文件"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"path":{"type":"string"},"columns":{"type":"array","items":{"type":"string"}},"rows":{"type":"array","items":{"type":"array"}},"format":{"type":"string","enum":["markdown","csv"]}},"required":["path","columns","rows"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = resolve_path(&context.cwd, &string_arg(&args, "path")?)?;
+        let columns = array_of_strings_arg(&args, "columns")?;
+        anyhow::ensure!(!columns.is_empty(), "columns 不能为空");
+        let rows = args
+            .get("rows")
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("rows 必须是数组"))?;
+        let format = optional_string_arg(&args, "format").unwrap_or_else(|| "markdown".to_string());
+        let mut content = String::new();
+        if format == "csv" {
+            content.push_str(&csv_line(&columns));
+            content.push('\n');
+            for row in rows {
+                let values = row
+                    .as_array()
+                    .ok_or_else(|| anyhow!("rows 必须是二维数组"))?
+                    .iter()
+                    .map(value_to_cell)
+                    .collect::<Vec<_>>();
+                content.push_str(&csv_line(&values));
+                content.push('\n');
+            }
+        } else {
+            content.push_str(&format!("| {} |\n", columns.join(" | ")));
+            content.push_str(&format!(
+                "| {} |\n",
+                columns
+                    .iter()
+                    .map(|_| "---")
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ));
+            for row in rows {
+                let values = row
+                    .as_array()
+                    .ok_or_else(|| anyhow!("rows 必须是二维数组"))?
+                    .iter()
+                    .map(value_to_cell)
+                    .collect::<Vec<_>>();
+                content.push_str(&format!("| {} |\n", values.join(" | ")));
+            }
+        }
+        write_text_file_with_confirmation(
+            self.name(),
+            &path,
+            content,
+            context,
+            format!("写表格 {}", path.display()),
+        )
+        .await
+    }
+}
+
+struct DiskManagerTool;
+
+#[async_trait]
+impl Tool for DiskManagerTool {
+    fn name(&self) -> &'static str {
+        "disk_manager"
+    }
+    fn description(&self) -> &'static str {
+        "管理磁盘和工作目录文件：usage、du、find_large、cleanup_empty_dirs"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["usage","du","find_large","cleanup_empty_dirs"]},"path":{"type":"string","description":"默认当前目录"},"limit":{"type":"integer","description":"find_large 返回数量，默认 20"}},"required":["action"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = match args.get("path").and_then(Value::as_str) {
+            Some(path) => resolve_path(&context.cwd, path)?,
+            None => context.cwd.clone(),
+        };
+        match string_arg(&args, "action")?.as_str() {
+            "usage" => {
+                run_command(
+                    vec![
+                        "df".to_string(),
+                        "-h".to_string(),
+                        path.display().to_string(),
+                    ],
+                    &context.cwd,
+                    20,
+                )
+                .await
+            }
+            "du" => {
+                run_command(
+                    vec![
+                        "du".to_string(),
+                        "-sh".to_string(),
+                        path.display().to_string(),
+                    ],
+                    &context.cwd,
+                    60,
+                )
+                .await
+            }
+            "find_large" => {
+                let limit = optional_u64_arg(&args, "limit", 20)
+                    .clamp(1, 200)
+                    .to_string();
+                run_command(
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "find {} -type f -printf '%s %p\\n' | sort -nr | head -n {}",
+                            shell_words::quote(&path.display().to_string()),
+                            limit
+                        ),
+                    ],
+                    &context.cwd,
+                    120,
+                )
+                .await
+            }
+            "cleanup_empty_dirs" => {
+                context
+                    .confirm(PermissionRequest {
+                        tool_name: self.name().to_string(),
+                        summary: format!("清理空目录 {}", path.display()),
+                        diff: None,
+                    })
+                    .await?;
+                run_command(
+                    vec![
+                        "find".to_string(),
+                        path.display().to_string(),
+                        "-type".to_string(),
+                        "d".to_string(),
+                        "-empty".to_string(),
+                        "-delete".to_string(),
+                    ],
+                    &context.cwd,
+                    120,
+                )
+                .await
+            }
+            action => anyhow::bail!("不支持的磁盘操作: {action}"),
+        }
+    }
+}
+
+struct ComputerManagerTool;
+
+#[async_trait]
+impl Tool for ComputerManagerTool {
+    fn name(&self) -> &'static str {
+        "computer_manager"
+    }
+    fn description(&self) -> &'static str {
+        "管理电脑任务：进程、服务状态、打开路径/URL、执行安全受控命令"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["processes","open","service_status","run"]},"target":{"type":"string"},"command":{"type":"string"},"timeout":{"type":"integer"}},"required":["action"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        match string_arg(&args, "action")?.as_str() {
+            "processes" => {
+                run_command(
+                    vec![
+                        "ps".to_string(),
+                        "-eo".to_string(),
+                        "pid,ppid,stat,comm,args".to_string(),
+                    ],
+                    &context.cwd,
+                    20,
+                )
+                .await
+            }
+            "open" => {
+                let target = string_arg(&args, "target")?;
+                context
+                    .confirm(PermissionRequest {
+                        tool_name: self.name().to_string(),
+                        summary: format!("打开 {}", target),
+                        diff: None,
+                    })
+                    .await?;
+                run_command(vec!["xdg-open".to_string(), target], &context.cwd, 20).await
+            }
+            "service_status" => {
+                run_command(
+                    vec![
+                        "systemctl".to_string(),
+                        "status".to_string(),
+                        string_arg(&args, "target")?,
+                        "--no-pager".to_string(),
+                    ],
+                    &context.cwd,
+                    20,
+                )
+                .await
+            }
+            "run" => {
+                let command = string_arg(&args, "command")?;
+                let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+                context
+                    .confirm(PermissionRequest {
+                        tool_name: self.name().to_string(),
+                        summary: format!("执行电脑管理命令: {command}"),
+                        diff: None,
+                    })
+                    .await?;
+                let output = timeout(
+                    Duration::from_secs(timeout_secs),
+                    Command::new("sh")
+                        .arg("-c")
+                        .arg(&command)
+                        .current_dir(&context.cwd)
+                        .output(),
+                )
+                .await
+                .map_err(|_| anyhow!("命令超时，已终止: {command}"))??;
+                Ok(render_process_output(command, output, timeout_secs))
+            }
+            action => anyhow::bail!("不支持的电脑管理操作: {action}"),
+        }
+    }
+}
+
+struct WebSearchTool;
+
+#[async_trait]
+impl Tool for WebSearchTool {
+    fn name(&self) -> &'static str {
+        "web_search"
+    }
+    fn description(&self) -> &'static str {
+        "通过搜索 URL 拉取网页搜索结果摘要"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"query":{"type":"string"},"engine_url":{"type":"string","description":"默认 DuckDuckGo html 搜索"},"timeout":{"type":"integer"}},"required":["query"]})
+    }
+    async fn execute(&self, args: Value, _context: &mut ToolContext) -> Result<ToolOutput> {
+        let query = string_arg(&args, "query")?;
+        let engine = optional_string_arg(&args, "engine_url")
+            .unwrap_or_else(|| "https://duckduckgo.com/html/?q=".to_string());
+        let timeout_secs = optional_u64_arg(&args, "timeout", 20).clamp(1, 120);
+        let url = format!("{}{}", engine, percent_encode_query(&query));
+        let client = http_client(timeout_secs)?;
+        let text = client
+            .get(&url)
+            .send()
+            .await
+            .context("网络搜索请求失败")?
+            .text()
+            .await
+            .context("读取搜索响应失败")?;
+        Ok(ToolOutput::ok(truncate_text(&strip_html(&text), 8000)))
+    }
+}
+
+struct BrowserTool;
+
+#[async_trait]
+impl Tool for BrowserTool {
+    fn name(&self) -> &'static str {
+        "browser"
+    }
+    fn description(&self) -> &'static str {
+        "调用浏览器相关能力：fetch 网页文本或 open URL"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["fetch","open"]},"url":{"type":"string"},"timeout":{"type":"integer"}},"required":["action","url"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let url = string_arg(&args, "url")?;
+        match string_arg(&args, "action")?.as_str() {
+            "fetch" => {
+                let text = http_client(optional_u64_arg(&args, "timeout", 20).clamp(1, 120))?
+                    .get(&url)
+                    .send()
+                    .await
+                    .context("浏览器 fetch 请求失败")?
+                    .text()
+                    .await
+                    .context("读取网页失败")?;
+                Ok(ToolOutput::ok(truncate_text(&strip_html(&text), 12_000)))
+            }
+            "open" => {
+                context
+                    .confirm(PermissionRequest {
+                        tool_name: self.name().to_string(),
+                        summary: format!("用系统浏览器打开 {}", url),
+                        diff: None,
+                    })
+                    .await?;
+                run_command(
+                    vec!["xdg-open".to_string(), url],
+                    &context.cwd,
+                    optional_u64_arg(&args, "timeout", 20).clamp(1, 120),
+                )
+                .await
+            }
+            action => anyhow::bail!("不支持的浏览器操作: {action}"),
+        }
+    }
+}
+
+struct NetworkLogsTool;
+
+#[async_trait]
+impl Tool for NetworkLogsTool {
+    fn name(&self) -> &'static str {
+        "network_logs"
+    }
+    fn description(&self) -> &'static str {
+        "获取网络日志和网络状态：connections、routes、dns、ping、curl_headers"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["connections","routes","dns","ping","curl_headers"]},"target":{"type":"string"},"timeout":{"type":"integer"}},"required":["action"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let timeout_secs = optional_u64_arg(&args, "timeout", 20).clamp(1, 120);
+        match string_arg(&args, "action")?.as_str() {
+            "connections" => {
+                run_command(
+                    vec!["ss".to_string(), "-tunap".to_string()],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            "routes" => {
+                run_command(
+                    vec!["ip".to_string(), "route".to_string()],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            "dns" => {
+                run_command(
+                    vec!["resolvectl".to_string(), "status".to_string()],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            "ping" => {
+                run_command(
+                    vec![
+                        "ping".to_string(),
+                        "-c".to_string(),
+                        "4".to_string(),
+                        string_arg(&args, "target")?,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            "curl_headers" => {
+                run_command(
+                    vec![
+                        "curl".to_string(),
+                        "-I".to_string(),
+                        string_arg(&args, "target")?,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            action => anyhow::bail!("不支持的网络日志操作: {action}"),
+        }
+    }
+}
+
+struct ComputerInfoTool;
+
+#[async_trait]
+impl Tool for ComputerInfoTool {
+    fn name(&self) -> &'static str {
+        "computer_info"
+    }
+    fn description(&self) -> &'static str {
+        "获取电脑信息：系统、CPU、内存、磁盘、网络、用户环境"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"scope":{"type":"string","enum":["summary","cpu","memory","disk","network","env"]}}})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        match args.get("scope").and_then(Value::as_str).unwrap_or("summary") {
+            "cpu" => run_command(vec!["lscpu".to_string()], &context.cwd, 20).await,
+            "memory" => run_command(vec!["free".to_string(), "-h".to_string()], &context.cwd, 20).await,
+            "disk" => run_command(vec!["df".to_string(), "-h".to_string()], &context.cwd, 20).await,
+            "network" => run_command(vec!["ip".to_string(), "addr".to_string()], &context.cwd, 20).await,
+            "env" => SystemControlTool.execute(json!({"action":"env"}), context).await,
+            "summary" => run_command(vec!["sh".to_string(), "-c".to_string(), "uname -a; echo; lscpu | head -20; echo; free -h; echo; df -h .; echo; ip route".to_string()], &context.cwd, 30).await,
+            scope => anyhow::bail!("不支持的信息范围: {scope}"),
+        }
+    }
+}
+
+struct DatabaseManagerTool;
+
+#[async_trait]
+impl Tool for DatabaseManagerTool {
+    fn name(&self) -> &'static str {
+        "database_manager"
+    }
+    fn description(&self) -> &'static str {
+        "连接和管理数据库，支持 sqlite 查询以及通过 psql/mysql/redis-cli 调用外部客户端"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"kind":{"type":"string","enum":["sqlite","postgres","mysql","redis"]},"action":{"type":"string","enum":["query","execute","schema","tables"]},"database":{"type":"string","description":"sqlite 文件路径或连接串/数据库名"},"query":{"type":"string"},"timeout":{"type":"integer"}},"required":["kind","action"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let kind = string_arg(&args, "kind")?;
+        let action = string_arg(&args, "action")?;
+        let timeout_secs = optional_u64_arg(&args, "timeout", 30).clamp(1, 600);
+        if matches!(action.as_str(), "execute") {
+            context
+                .confirm(PermissionRequest {
+                    tool_name: self.name().to_string(),
+                    summary: "执行数据库写入/变更语句".to_string(),
+                    diff: None,
+                })
+                .await?;
+        }
+        match (kind.as_str(), action.as_str()) {
+            ("sqlite", "tables") => {
+                run_command(
+                    vec![
+                        "sqlite3".to_string(),
+                        resolve_path(&context.cwd, &string_arg(&args, "database")?)?
+                            .display()
+                            .to_string(),
+                        ".tables".to_string(),
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            ("sqlite", "schema") => {
+                run_command(
+                    vec![
+                        "sqlite3".to_string(),
+                        resolve_path(&context.cwd, &string_arg(&args, "database")?)?
+                            .display()
+                            .to_string(),
+                        ".schema".to_string(),
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            ("sqlite", "query") | ("sqlite", "execute") => {
+                run_command(
+                    vec![
+                        "sqlite3".to_string(),
+                        resolve_path(&context.cwd, &string_arg(&args, "database")?)?
+                            .display()
+                            .to_string(),
+                        string_arg(&args, "query")?,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            ("postgres", "query") | ("postgres", "execute") => {
+                run_command(
+                    vec![
+                        "psql".to_string(),
+                        string_arg(&args, "database")?,
+                        "-c".to_string(),
+                        string_arg(&args, "query")?,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            ("mysql", "query") | ("mysql", "execute") => {
+                run_command(
+                    vec![
+                        "mysql".to_string(),
+                        string_arg(&args, "database")?,
+                        "-e".to_string(),
+                        string_arg(&args, "query")?,
+                    ],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            ("redis", "query") | ("redis", "execute") => {
+                run_command(
+                    vec!["redis-cli".to_string(), string_arg(&args, "query")?],
+                    &context.cwd,
+                    timeout_secs,
+                )
+                .await
+            }
+            _ => anyhow::bail!("不支持的数据库操作: {kind}/{action}"),
+        }
+    }
+}
+
+struct UiDesignTool;
+
+#[async_trait]
+impl Tool for UiDesignTool {
+    fn name(&self) -> &'static str {
+        "ui_design"
+    }
+    fn description(&self) -> &'static str {
+        "生成 UI 智能设计规格、组件结构、文案和可保存的设计文档"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"brief":{"type":"string"},"path":{"type":"string"},"platform":{"type":"string"},"audience":{"type":"string"},"style":{"type":"string"}},"required":["brief"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let brief = string_arg(&args, "brief")?;
+        let prompt = format!("请输出一份可执行 UI 设计规格，包含信息架构、关键界面、组件、状态、交互、响应式布局、视觉系统、可访问性与实现注意事项。\n平台：{}\n受众：{}\n风格：{}\n需求：{}", optional_string_arg(&args, "platform").unwrap_or_else(|| "web/desktop".to_string()), optional_string_arg(&args, "audience").unwrap_or_else(|| "目标用户".to_string()), optional_string_arg(&args, "style").unwrap_or_else(|| "克制、清晰、专业".to_string()), brief);
+        let client = ChatCompletionsClient::new(context.api_key.clone());
+        let response = client
+            .complete_once(
+                "Gemini-3.5-Flash",
+                Some("你是资深产品设计师和前端架构师。"),
+                &prompt,
+                4096,
+            )
+            .await?;
+        if let Some(raw_path) = args.get("path").and_then(Value::as_str) {
+            let path = resolve_path(&context.cwd, raw_path)?;
+            return write_text_file_with_confirmation(
+                self.name(),
+                &path,
+                response,
+                context,
+                format!("保存 UI 设计文档 {}", path.display()),
+            )
+            .await;
+        }
+        Ok(ToolOutput::ok(response))
+    }
+}
+
+struct LongMemoryTool;
+
+#[async_trait]
+impl Tool for LongMemoryTool {
+    fn name(&self) -> &'static str {
+        "long_memory"
+    }
+    fn description(&self) -> &'static str {
+        "管理项目长期记忆 .yunzhi/memory.md，支持 read、append、replace、clear"
+    }
+    fn schema(&self) -> Value {
+        json!({"type":"object","properties":{"action":{"type":"string","enum":["read","append","replace","clear"]},"content":{"type":"string"}},"required":["action"]})
+    }
+    async fn execute(&self, args: Value, context: &mut ToolContext) -> Result<ToolOutput> {
+        let path = context.cwd.join(".yunzhi").join("memory.md");
+        match string_arg(&args, "action")?.as_str() {
+            "read" => Ok(ToolOutput::ok(
+                fs::read_to_string(&path).await.unwrap_or_default(),
+            )),
+            "append" => {
+                let old = fs::read_to_string(&path).await.unwrap_or_default();
+                let mut new = old.clone();
+                if !new.ends_with('\n') && !new.is_empty() {
+                    new.push('\n');
+                }
+                new.push_str(&string_arg(&args, "content")?);
+                new.push('\n');
+                write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    new,
+                    context,
+                    "追加长期记忆".to_string(),
+                )
+                .await
+            }
+            "replace" => {
+                write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    string_arg(&args, "content")?,
+                    context,
+                    "替换长期记忆".to_string(),
+                )
+                .await
+            }
+            "clear" => {
+                write_text_file_with_confirmation(
+                    self.name(),
+                    &path,
+                    String::new(),
+                    context,
+                    "清空长期记忆".to_string(),
+                )
+                .await
+            }
+            action => anyhow::bail!("不支持的长期记忆操作: {action}"),
+        }
+    }
+}
+
+fn value_to_cell(value: &Value) -> String {
+    value
+        .as_str()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| value.to_string())
+        .replace('\n', " ")
+}
+
+fn csv_line(values: &[String]) -> String {
+    values
+        .iter()
+        .map(|value| format!("\"{}\"", value.replace('"', "\"\"")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn strip_html(raw: &str) -> String {
+    let mut output = String::new();
+    let mut in_tag = false;
+    for char in raw.chars() {
+        match char {
+            '<' => in_tag = true,
+            '>' => {
+                in_tag = false;
+                output.push(' ');
+            }
+            _ if !in_tag => output.push(char),
+            _ => {}
+        }
+    }
+    output
+        .replace("&nbsp;", " ")
+        .replace("&amp;", "&")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
+}
+
+fn percent_encode_query(query: &str) -> String {
+    let mut encoded = String::new();
+    for byte in query.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char)
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn http_client(timeout_secs: u64) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(timeout_secs))
+        .build()
+        .context("创建 HTTP 客户端失败")
+}
+
+fn render_process_output(
+    command: String,
+    output: std::process::Output,
+    timeout_secs: u64,
+) -> ToolOutput {
+    let mut rendered = format!(
+        "command: {}\ntimeout: {}s\nexit: {}\n",
+        command, timeout_secs, output.status
+    );
+    if !output.stdout.is_empty() {
+        rendered.push_str("stdout:\n");
+        rendered.push_str(&String::from_utf8_lossy(&output.stdout));
+    }
+    if !output.stderr.is_empty() {
+        rendered.push_str("\nstderr:\n");
+        rendered.push_str(&String::from_utf8_lossy(&output.stderr));
+    }
+    ToolOutput {
+        content: rendered,
+        is_error: !output.status.success(),
+    }
+}
+
 async fn copy_path(source: &Path, destination: &Path) -> Result<()> {
     let metadata = fs::metadata(source)
         .await
@@ -1795,5 +2762,84 @@ mod tests {
             .execute("delete_path", json!({"path":"nested"}), &mut ctx)
             .await;
         assert!(output.is_error);
+    }
+
+    #[tokio::test]
+    async fn creates_presentation_markdown() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "create_presentation",
+                json!({
+                    "path":"deck.md",
+                    "title":"产品计划",
+                    "audience":"研发团队",
+                    "slides":[
+                        {"title":"目标","bullets":["统一工具能力","降低手工操作"]},
+                        {"title":"下一步","speaker_notes":"控制节奏"}
+                    ]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let content = std::fs::read_to_string(dir.path().join("deck.md")).unwrap();
+        assert!(content.contains("marp: true"));
+        assert!(content.contains("# 产品计划"));
+        assert!(content.contains("- 统一工具能力"));
+    }
+
+    #[tokio::test]
+    async fn writes_csv_table() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "write_table",
+                json!({
+                    "path":"table.csv",
+                    "format":"csv",
+                    "columns":["name","note"],
+                    "rows":[["yunzhi","hello, world"],["quote","a \" b"]]
+                }),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let content = std::fs::read_to_string(dir.path().join("table.csv")).unwrap();
+        assert!(content.contains("\"name\",\"note\""));
+        assert!(content.contains("\"yunzhi\",\"hello, world\""));
+        assert!(content.contains("\"quote\",\"a \"\" b\""));
+    }
+
+    #[tokio::test]
+    async fn manages_long_memory_file() {
+        let dir = tempdir().unwrap();
+        let registry = ToolRegistry::builtin();
+        let mut ctx = context(dir.path());
+        let output = registry
+            .execute(
+                "long_memory",
+                json!({"action":"append","content":"- 记住项目约定"}),
+                &mut ctx,
+            )
+            .await;
+        assert!(!output.is_error, "{}", output.content);
+        let output = registry
+            .execute("long_memory", json!({"action":"read"}), &mut ctx)
+            .await;
+        assert!(output.content.contains("记住项目约定"));
+    }
+
+    #[test]
+    fn encodes_query_and_strips_html() {
+        assert_eq!(percent_encode_query("a b/c?"), "a+b%2Fc%3F");
+        assert_eq!(
+            strip_html("<h1>A&nbsp;&amp;&quot;B&quot;</h1>\n<p>C</p>"),
+            "A &\"B\" C"
+        );
     }
 }
