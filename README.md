@@ -77,7 +77,7 @@ yunzhi
 - `system_control` 提供受控系统操作：查看工作目录、环境变量、进程列表、磁盘信息和终止进程。
 - 启动时读取项目级 `.yunzhi/memory.md` 并注入 system prompt；条目化记忆会只注入最近摘要，避免长期记忆无限挤占上下文，旧版自由 Markdown 仍兼容。
 - 对话历史保存在内存中，超过阈值后做简单摘要压缩。
-- 交互模式支持 `/help`、`/mode`、`/model`、`/clear`、`/session`、`/exit`；快捷键包括 Enter 发送、Ctrl+J 换行、↑↓ 翻历史、Tab 应用补全、PageUp/PageDown 或鼠标滚轮滚动输出、Ctrl+Home 顶部、Ctrl+End 底部、Ctrl+C 退出。
+- 交互模式支持 `/help`、`/mode`、`/model`、`/clear`、`/session`、`/exit`；快捷键包括 Enter 发送、Ctrl+J 换行、系统粘贴、多行粘贴、↑↓ 翻历史、Tab 应用补全、PageUp/PageDown 或鼠标滚轮滚动输出、Ctrl+Home 顶部、Ctrl+End 底部、Ctrl+C 退出。
 
 ## 智能体模式
 

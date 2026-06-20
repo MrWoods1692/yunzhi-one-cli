@@ -373,6 +373,7 @@ pub async fn run_fullscreen(
                             }
                         }
                         Event::Mouse(mouse) => handle_mouse(mouse.kind, &mut app),
+                        Event::Paste(text) => app.insert_text_at_cursor(&text),
                         _ => {}
                     }
                 }
@@ -511,7 +512,7 @@ impl FullscreenApp {
         Self {
             version,
             lines: vec![LogLine::info(format!(
-                "云智 One v{version}。输入 /help 查看命令，Enter 发送，Ctrl+J 换行，Ctrl+C 退出。"
+                "云智 One v{version}。输入 /help 查看命令，Enter 发送，Ctrl+J 换行，支持系统粘贴，Ctrl+C 退出。"
             ))],
             input: Vec::new(),
             cursor: 0,
@@ -827,6 +828,13 @@ impl FullscreenApp {
         self.scroll = 0;
     }
 
+    fn insert_text_at_cursor(&mut self, text: &str) {
+        let inserted = text.chars().collect::<Vec<_>>();
+        let inserted_len = inserted.len();
+        self.input.splice(self.cursor..self.cursor, inserted);
+        self.cursor += inserted_len;
+    }
+
     fn input_string(&self) -> String {
         self.input.iter().collect()
     }
@@ -886,8 +894,7 @@ fn handle_key(
         KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_up(5),
         KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => app.scroll_down(5),
         KeyCode::Char(ch) => {
-            app.input.insert(app.cursor, ch);
-            app.cursor += 1;
+            app.insert_text_at_cursor(&ch.to_string());
         }
         KeyCode::Backspace => {
             if app.cursor > 0 {
@@ -1165,7 +1172,7 @@ fn help_text() -> String {
         "/model <模型名> 切换本会话主控模型",
         "/session help 查看会话命令",
         "/exit 退出",
-        "Enter 发送，Ctrl+J 换行，↑↓ 翻历史，Tab 应用补全。",
+        "Enter 发送，Ctrl+J 换行，支持系统粘贴，↑↓ 翻历史，Tab 应用补全。",
         "PageUp/PageDown 或鼠标滚轮滚动输出，Ctrl+Home 顶部，Ctrl+End 底部。",
     ]
     .join("\n")
@@ -1322,5 +1329,16 @@ mod tests {
         assert!(text.contains("PageUp/PageDown"));
         assert!(text.contains("Ctrl+Home"));
         assert!(text.contains("Ctrl+End"));
+    }
+
+    #[test]
+    fn paste_inserts_multiline_text_at_cursor() {
+        let mut app = FullscreenApp::new("test");
+        app.insert_text_at_cursor("hello world");
+        app.cursor = 5;
+        app.insert_text_at_cursor("\n粘贴\n");
+
+        assert_eq!(app.input_string(), "hello\n粘贴\n world");
+        assert_eq!(app.cursor, "hello\n粘贴\n".chars().count());
     }
 }
