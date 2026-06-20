@@ -22,7 +22,8 @@ pub fn load_config() -> Result<Option<AppConfig>> {
     if !path.exists() {
         return Ok(None);
     }
-    let raw = fs::read_to_string(&path).with_context(|| format!("读取配置失败: {}", path.display()))?;
+    let raw =
+        fs::read_to_string(&path).with_context(|| format!("读取配置失败: {}", path.display()))?;
     let cfg = toml::from_str::<AppConfig>(&raw).context("解析 ~/.yunzhi/config.toml 失败")?;
     if cfg.api_key.trim().is_empty() {
         Ok(None)
@@ -64,7 +65,14 @@ pub fn masked_key(api_key: &str) -> String {
         return "****".to_string();
     }
     let prefix: String = chars.iter().take(4).collect();
-    let suffix: String = chars.iter().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+    let suffix: String = chars
+        .iter()
+        .rev()
+        .take(4)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
     format!("{}****{}", prefix, suffix)
 }
 
@@ -73,7 +81,8 @@ pub fn load_project_memory() -> Result<Option<String>> {
     if !path.exists() {
         return Ok(None);
     }
-    let content = fs::read_to_string(&path).with_context(|| format!("读取项目记忆失败: {}", path.display()))?;
+    let content = fs::read_to_string(&path)
+        .with_context(|| format!("读取项目记忆失败: {}", path.display()))?;
     if content.trim().is_empty() {
         Ok(None)
     } else {
