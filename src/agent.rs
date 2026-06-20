@@ -2,6 +2,9 @@ use crate::config::load_project_memory;
 use crate::extensions::render_skills_index;
 use crate::hooks::{format_hook_runs, run_matching_hooks, HookEvent};
 use crate::llm::{ChatRequest, LlmClient, ToolChoice};
+use crate::session::{
+    create_checkpoint, list_sessions, load_session, new_session, rollback_checkpoint, save_session,
+};
 use crate::tools::{PermissionPrompter, PermissionRequest, ToolContext, ToolRegistry};
 use crate::tui;
 use crate::types::{AgentMode, AgentOptions, ContentBlock, Message, Role, StreamEvent};
@@ -100,6 +103,58 @@ impl<C: LlmClient> Agent<C> {
 
     pub fn clear(&mut self) -> Result<()> {
         self.history.clear();
+        self.pending_plan = None;
+        self.refresh_system_prompt()?;
+        Ok(())
+    }
+
+    pub fn save_session(&self, id: &str) -> Result<PathBuf> {
+        save_session(
+            &self.context.cwd,
+            &new_session(id.to_string(), self.history.clone()),
+        )
+    }
+
+    pub fn resume_session(&mut self, id: &str) -> Result<()> {
+        let session = load_session(&self.context.cwd, id)?;
+        self.history = session.messages;
+        self.pending_plan = None;
+        self.refresh_system_prompt()?;
+        Ok(())
+    }
+
+    pub fn list_sessions(&self) -> Result<Vec<String>> {
+        list_sessions(&self.context.cwd)
+    }
+
+    pub fn share_session(&self, id: &str) -> Result<PathBuf> {
+        let session = load_session(&self.context.cwd, id)?;
+        let path = self
+            .context
+            .cwd
+            .join(".yunzhi")
+            .join("sessions")
+            .join(format!("{id}.share.json"));
+        let raw = serde_json::to_string_pretty(&session)?;
+        std::fs::write(&path, raw)?;
+        Ok(path)
+    }
+
+    pub fn checkpoint_session(&self, id: &str, note: Option<String>) -> Result<String> {
+        let mut session = match load_session(&self.context.cwd, id) {
+            Ok(mut session) => {
+                session.messages = self.history.clone();
+                session
+            }
+            Err(_) => new_session(id.to_string(), self.history.clone()),
+        };
+        create_checkpoint(&self.context.cwd, &mut session, note)
+    }
+
+    pub fn rollback_session(&mut self, id: &str, checkpoint_id: &str) -> Result<()> {
+        let session = load_session(&self.context.cwd, id)?;
+        rollback_checkpoint(&self.context.cwd, &session, checkpoint_id)?;
+        self.history = session.messages;
         self.pending_plan = None;
         self.refresh_system_prompt()?;
         Ok(())

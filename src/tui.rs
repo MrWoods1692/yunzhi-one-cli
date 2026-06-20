@@ -23,6 +23,7 @@ pub fn print_help() {
     println!("  /clear  清空当前对话上下文");
     println!("  /mode   查看可选模式");
     println!("  /mode <模式>  切换模式");
+    println!("  /session help  查看会话保存、恢复、checkpoint 和 rollback 命令");
     println!("  /exit   退出");
     println!("快捷键: Ctrl+C 中断当前输入，Ctrl+D 退出。\n");
 }

@@ -184,6 +184,12 @@ async fn run_interactive(
                     }
                     "/mode" => tui::print_modes(agent.mode()),
                     _ => {
+                        if let Some(command) = input.strip_prefix("/session") {
+                            if let Err(error) = handle_session_command(&mut agent, command.trim()) {
+                                eprintln!("错误: {error:#}");
+                            }
+                            continue;
+                        }
                         if let Some(raw_mode) = input.strip_prefix("/mode ") {
                             match AgentMode::from_str(raw_mode) {
                                 Ok(mode) => {
@@ -226,4 +232,61 @@ fn is_confirmation(input: &str) -> bool {
         input.trim().to_ascii_lowercase().as_str(),
         "y" | "yes" | "ok" | "okay" | "确认" | "可以" | "好" | "好的"
     )
+}
+
+fn handle_session_command(agent: &mut Agent<AnthropicLikeClient>, command: &str) -> Result<()> {
+    let mut parts = command.split_whitespace();
+    match parts.next() {
+        None | Some("help") => {
+            println!("/session list");
+            println!("/session save <name>");
+            println!("/session resume <name>");
+            println!("/session share <name>");
+            println!("/session checkpoint <name> [note]");
+            println!("/session rollback <name> <checkpoint>\n");
+        }
+        Some("list") => {
+            let sessions = agent.list_sessions()?;
+            if sessions.is_empty() {
+                println!("暂无已保存会话。\n");
+            } else {
+                for session in sessions {
+                    println!("{session}");
+                }
+                println!();
+            }
+        }
+        Some("save") => {
+            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
+            let path = agent.save_session(id)?;
+            println!("会话已保存: {}\n", path.display());
+        }
+        Some("resume") => {
+            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
+            agent.resume_session(id)?;
+            println!("已恢复会话: {id}\n");
+        }
+        Some("share") => {
+            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
+            let path = agent.share_session(id)?;
+            println!("分享文件已生成: {}\n", path.display());
+        }
+        Some("checkpoint") => {
+            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
+            let note = parts.collect::<Vec<_>>().join(" ");
+            let checkpoint =
+                agent.checkpoint_session(id, if note.is_empty() { None } else { Some(note) })?;
+            println!("checkpoint 已创建: {checkpoint}\n");
+        }
+        Some("rollback") => {
+            let id = parts.next().ok_or_else(|| anyhow::anyhow!("缺少会话名"))?;
+            let checkpoint = parts
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("缺少 checkpoint id"))?;
+            agent.rollback_session(id, checkpoint)?;
+            println!("已回滚到 checkpoint: {checkpoint}\n");
+        }
+        Some(other) => anyhow::bail!("未知 session 命令: {other}"),
+    }
+    Ok(())
 }
